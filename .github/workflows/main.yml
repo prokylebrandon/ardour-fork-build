@@ -121,8 +121,16 @@ jobs:
             | Set-Content libs/tk/ydkmm/wscript
         shell: pwsh
 
+      # FIX: --dist-target defaults to 'auto', which on Windows resolves
+      # to a bare CPU-architecture string (e.g. 'x86_64'), never to
+      # 'msvc'. wscript only skips its POSIX-only dlopen/dlfcn.h probe
+      # (and several other Windows-specific code paths) when
+      # dist_target is exactly 'msvc'. Without this flag, configure
+      # fails with:
+      #   Checking for function 'dlopen' in dlfcn.h : no
+      #   The configuration failed
       - name: waf configure
-        run: python waf configure --prefix="$env:INSTALL_DIR" --optimize
+        run: python waf configure --dist-target=msvc --prefix="$env:INSTALL_DIR" --optimize
         shell: pwsh
 
       - name: waf build
