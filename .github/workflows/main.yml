@@ -87,7 +87,7 @@ jobs:
             boost-format boost-optional boost-smart-ptr `
             glib glibmm gtkmm cairomm pangomm libsigcpp `
             libsndfile libsamplerate aubio taglib `
-            curl liblo fftw3 flac rubberband `
+            curl liblo fftw3 libflac rubberband `
             lilv serd sord sratom lv2 `
             --triplet $env:VCPKG_TRIPLET
         shell: pwsh
