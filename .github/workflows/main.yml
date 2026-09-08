@@ -85,7 +85,7 @@ jobs:
         run: |
           C:\vcpkg\vcpkg.exe install `
             boost-format boost-optional boost-smart-ptr `
-            glib glibmm gtkmm cairomm pangomm libsigcpp-3 `
+            glib glibmm gtkmm cairomm pangomm libsigcpp `
             libsndfile libsamplerate aubio taglib `
             curl liblo fftw3 flac rubberband `
             lilv serd sord sratom lv2 `
