@@ -1,0 +1,148 @@
+name: Build Ardour (Windows / MSVC)
+
+# Manual trigger only, as requested. The inputs let you tweak a run
+# without editing this file every time.
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "waf build configuration"
+        required: true
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+      vcpkg_ref:
+        description: "vcpkg commit/tag to pin (blank = latest)"
+        required: false
+        default: ""
+
+env:
+  VCPKG_TRIPLET: x64-windows
+  INSTALL_DIR: ${{ github.workspace }}\dist
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Puts cl.exe / link.exe / ml64.exe on PATH so waf's MSVC autodetect
+      # can find them without hardcoding a toolset version.
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Needed to generate .def files for symbols MSVC can't auto-export.
+      - name: Install LLVM (for llvm-nm)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
+      - name: Ensure Strawberry Perl is on PATH
+        run: echo "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
+        shell: pwsh
+
+      # ---------------------------------------------------------------
+      # Dependencies via vcpkg.
+      # ASSUMPTION: this package list is a best-effort guess based on
+      # Ardour's known dependency set (see wscript / `waf configure
+      # --help`). Run `waf configure` once, see what it says is missing,
+      # and add/remove packages here accordingly. If your fork already
+      # ships a vcpkg.json manifest, replace this block with
+      # `vcpkg install --triplet ${{ env.VCPKG_TRIPLET }}` in manifest mode
+      # instead of listing packages by hand.
+      # ---------------------------------------------------------------
+      - name: Restore vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-${{ env.VCPKG_TRIPLET }}-v1
+
+      - name: Bootstrap vcpkg
+        run: |
+          if (!(Test-Path "C:\vcpkg")) {
+            git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          }
+          if ("${{ inputs.vcpkg_ref }}" -ne "") {
+            git -C C:\vcpkg checkout ${{ inputs.vcpkg_ref }}
+          }
+          C:\vcpkg\bootstrap-vcpkg.bat
+        shell: pwsh
+
+      - name: Install dependencies via vcpkg
+        run: |
+          C:\vcpkg\vcpkg.exe install `
+            boost-format boost-optional boost-scoped-ptr boost-shared-ptr `
+            glib glibmm gtkmm cairomm pangomm sigc++ `
+            libsndfile libsamplerate aubio taglib `
+            curl liblo fftw3 flac rubberband `
+            lilv serd sord sratom lv2 `
+            --triplet $env:VCPKG_TRIPLET
+        shell: pwsh
+
+      - name: Point pkg-config / PATH at vcpkg
+        run: |
+          $vcpkgInstalled = "C:\vcpkg\installed\$env:VCPKG_TRIPLET"
+          echo "PKG_CONFIG_PATH=$vcpkgInstalled\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "$vcpkgInstalled\tools\pkgconf" >> $env:GITHUB_PATH
+          echo "$vcpkgInstalled\bin" >> $env:GITHUB_PATH
+        shell: pwsh
+
+      # ---------------------------------------------------------------
+      # Known wscript version-pin mismatches between stock Ardour and
+      # current vcpkg package versions (per the Ardour MSVC build thread).
+      # DELETE this step if your fork's MSVCMixbus3 / MSVCardour3 /
+      # msvc_extra_headers setup already accounts for this.
+      # ---------------------------------------------------------------
+      - name: Patch wscript library version pins
+        run: |
+          (Get-Content wscript) `
+            -replace 'glibmm-2\.4','glibmm-2.68' `
+            -replace 'giomm-2\.4','giomm-2.68' `
+            | Set-Content wscript
+          (Get-Content libs/tk/ztkmm/wscript) `
+            -replace 'sigc\+\+-2\.0','sigc++-3.0' `
+            | Set-Content libs/tk/ztkmm/wscript
+          (Get-Content libs/tk/ydkmm/wscript) `
+            -replace 'cairomm-1\.0','cairomm-1.16' `
+            -replace 'pangomm-1\.4','pangomm-2.48' `
+            | Set-Content libs/tk/ydkmm/wscript
+        shell: pwsh
+
+      - name: waf configure
+        run: python waf configure --prefix="$env:INSTALL_DIR" --optimize
+        shell: pwsh
+
+      - name: waf build
+        run: python waf build -j2
+        shell: pwsh
+
+      - name: waf install
+        run: python waf install
+        shell: pwsh
+
+      # Ardour's .exe won't find its runtime DLLs unless vcpkg's own
+      # bin folder is copied alongside the installed binaries.
+      - name: Bundle runtime DLLs
+        run: |
+          Copy-Item "C:\vcpkg\installed\$env:VCPKG_TRIPLET\bin\*.dll" -Destination "$env:INSTALL_DIR" -Force
+        shell: pwsh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ardour-windows-msvc-${{ github.run_number }}
+          path: ${{ env.INSTALL_DIR }}
+          retention-days: 14
