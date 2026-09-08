@@ -26,10 +26,15 @@ jobs:
   build:
     runs-on: windows-2022
     steps:
+      # filter: blob:none = blobless partial clone. Still fetches every
+      # commit and tag (git describe HEAD in wscript needs those for the
+      # version string) but skips downloading historical file contents,
+      # which is most of the transfer cost on a repo with this much history.
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          filter: blob:none
           submodules: recursive
 
       - name: Set up Python
@@ -64,44 +69,95 @@ jobs:
       # `vcpkg install --triplet ${{ env.VCPKG_TRIPLET }}` in manifest mode
       # instead of listing packages by hand.
       # ---------------------------------------------------------------
-      # Cache key bumped to v2 because the package list changed (added
-      # pthreads, portaudio) — v1 caches must not be reused, or the new
-      # packages would silently never get installed.
-      - name: Restore vcpkg cache
+
+      # Single source of truth for the package list. The installed-package
+      # cache key below hashes this file, so adding/removing a package
+      # automatically invalidates the right cache entry — no more manually
+      # bumping a "-v2" suffix and hoping nobody forgets.
+      - name: Write vcpkg package manifest
+        run: |
+          @'
+          boost-format
+          boost-optional
+          boost-smart-ptr
+          glib
+          glibmm
+          gtkmm
+          cairomm
+          pangomm
+          libsigcpp
+          libsndfile
+          libsamplerate
+          aubio
+          taglib
+          curl
+          liblo
+          fftw3
+          libflac
+          rubberband
+          lilv
+          serd
+          sord
+          sratom
+          lv2
+          pthreads
+          portaudio
+          '@ | Set-Content -Path vcpkg-packages.txt
+        shell: pwsh
+
+      # Caches the vcpkg TOOL itself (its git checkout + built vcpkg.exe),
+      # separately from the packages it installs. Without this, every run
+      # re-clones the whole vcpkg repo and rebuilds vcpkg.exe from source
+      # via bootstrap-vcpkg.bat before installing a single package.
+      # Key includes run_id so an unpinned ("latest") run always misses on
+      # its own key and re-saves; restore-keys still matches the most
+      # recent prior cache to seed it, then the Bootstrap step below does
+      # a cheap incremental `git pull` to bring it current.
+      - name: Restore vcpkg tool cache
         uses: actions/cache@v4
         with:
-          path: C:\vcpkg\installed
-          key: vcpkg-${{ env.VCPKG_TRIPLET }}-v2
+          path: C:\vcpkg
+          key: vcpkg-tool-${{ runner.os }}-${{ inputs.vcpkg_ref != '' && inputs.vcpkg_ref || github.run_id }}
+          restore-keys: |
+            vcpkg-tool-${{ runner.os }}-
 
       - name: Bootstrap vcpkg
         run: |
           if (!(Test-Path "C:\vcpkg")) {
             git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
           }
+          Push-Location C:\vcpkg
+          git fetch origin --tags --quiet
           if ("${{ inputs.vcpkg_ref }}" -ne "") {
-            git -C C:\vcpkg checkout ${{ inputs.vcpkg_ref }}
+            git checkout ${{ inputs.vcpkg_ref }}
+          } else {
+            git checkout master --quiet
+            git pull --ff-only origin master
           }
+          Pop-Location
+          # No-ops quickly if vcpkg.exe is already up to date with this checkout.
           C:\vcpkg\bootstrap-vcpkg.bat
         shell: pwsh
 
+      # Cache of the already-built packages themselves. Keyed on the
+      # manifest file's hash (see "Write vcpkg package manifest" above),
+      # with a prefix restore-key fallback: even after the package list
+      # changes, a near-miss still restores most of the tree, and `vcpkg
+      # install` only builds what's actually missing rather than starting
+      # from zero.
+      - name: Restore vcpkg installed-packages cache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-installed-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('vcpkg-packages.txt') }}
+          restore-keys: |
+            vcpkg-installed-${{ env.VCPKG_TRIPLET }}-
+
       - name: Install dependencies via vcpkg
         run: |
-          C:\vcpkg\vcpkg.exe install `
-            boost-format boost-optional boost-smart-ptr `
-            glib glibmm gtkmm cairomm pangomm libsigcpp `
-            libsndfile libsamplerate aubio taglib `
-            curl liblo fftw3 libflac rubberband `
-            lilv serd sord sratom lv2 `
-            pthreads portaudio `
-            --triplet $env:VCPKG_TRIPLET
+          $packages = Get-Content vcpkg-packages.txt | Where-Object { $_.Trim() -ne '' }
+          C:\vcpkg\vcpkg.exe install @packages --triplet $env:VCPKG_TRIPLET
         shell: pwsh
-      # ADDED: pthreads and portaudio.
-      # - pthreads (PThreads4W) provides pthreadVC3.lib / pthreadVC3d.lib,
-      #   which wscript links unconditionally for dist_target == 'msvc'.
-      # - portaudio is auto-added to the backend list for dist_target in
-      #   ('mingw','msvc'); without it the portaudio pkg-config check in
-      #   configure fails.
-      # Both were confirmed against vcpkg's port registry, not guessed.
 
       - name: Point pkg-config / PATH at vcpkg
         run: |
@@ -132,20 +188,20 @@ jobs:
             | Set-Content libs/tk/ydkmm/wscript
         shell: pwsh
 
-      # FIX: --dist-target defaults to 'auto', which on Windows resolves
-      # to a bare CPU-architecture string (e.g. 'x86_64'), never to
-      # 'msvc'. wscript only skips its POSIX-only dlopen/dlfcn.h probe
-      # (and several other Windows-specific code paths) when
-      # dist_target is exactly 'msvc'. Without this flag, configure
-      # fails with:
-      #   Checking for function 'dlopen' in dlfcn.h : no
-      #   The configuration failed
+      # --dist-target defaults to 'auto', which on Windows resolves to a
+      # bare CPU-architecture string (e.g. 'x86_64'), never to 'msvc'.
+      # wscript only skips its POSIX-only dlopen/dlfcn.h probe (and several
+      # other Windows-specific code paths — MSVC tool loading, pthreadVC3
+      # linkage, the portaudio backend) when dist_target is exactly 'msvc'.
       - name: waf configure
         run: python waf configure --dist-target=msvc --prefix="$env:INSTALL_DIR" --optimize
         shell: pwsh
 
+      # -j scales to whatever the runner actually has instead of a
+      # hardcoded guess, so this stays correct if you ever move to a
+      # larger/self-hosted runner.
       - name: waf build
-        run: python waf build -j2
+        run: python waf build -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
 
       - name: waf install
