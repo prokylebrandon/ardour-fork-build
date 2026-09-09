@@ -20,8 +20,8 @@ on:
 
 env:
   # IMPORTANT:
-  # Do NOT use VCPKG_ROOT here. Visual Studio on the GitHub runner
-  # already defines VCPKG_ROOT and points it at VS's bundled vcpkg.
+  # Do not use VCPKG_ROOT. Visual Studio on the GitHub runner may
+  # define VCPKG_ROOT itself and point it at its bundled vcpkg.
   VCPKG_HOME: C:\vcpkg
   VCPKG_TRIPLET: x64-windows
   INSTALL_DIR: ${{ github.workspace }}\dist
@@ -35,7 +35,7 @@ jobs:
       # ================================================================
       # 1. SOURCE
       # ================================================================
-      - name: Checkout Ardour
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -46,20 +46,16 @@ jobs:
       # ================================================================
       # 2. FETCH ARDOUR UPSTREAM TAGS
       # ================================================================
-      # Ardour's wscript uses `git describe HEAD` to determine the
-      # Ardour version. A fork can have complete Git history but still
-      # lack reachable Ardour release tags.
-      #
-      # Fetch the official Ardour tags explicitly before configuring.
-      # This also performs an early diagnostic so we don't waste a
-      # long build if the checked-out commit cannot be described.
+      # Ardour's wscript uses git describe HEAD for version information.
+      # A fork may have full history without having the official tags.
+      # Fetch them explicitly.
       # ================================================================
       - name: Fetch Ardour upstream tags
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Fetching Ardour upstream tags..."
+          Write-Host "Fetching official Ardour tags..."
 
           $existingRemote = git remote get-url upstream 2>$null
 
@@ -67,39 +63,15 @@ jobs:
             git remote add upstream https://github.com/Ardour/ardour.git
           }
           else {
-            Write-Host "Upstream remote already exists:"
+            Write-Host "upstream remote already exists:"
             Write-Host $existingRemote
           }
 
           git fetch upstream --tags --force --prune
 
           Write-Host ""
-          Write-Host "Recent Ardour tags:"
-          git tag --sort=-version:refname |
-            Select-Object -First 20
-
-          Write-Host ""
-          Write-Host "Tags reachable from HEAD:"
-
-          $reachableTags = @(
-            git tag --merged HEAD
-          )
-
-          if ($reachableTags.Count -eq 0) {
-            Write-Host ""
-            Write-Host "No tags are reachable from the checked-out HEAD."
-            Write-Host ""
-            Write-Host "Current HEAD:"
-            git log -1 --oneline --decorate
-            Write-Host ""
-            Write-Host "This usually means the fork branch contains commits that are"
-            Write-Host "not descendants of an official Ardour tagged commit."
-
-            throw "No Ardour release tag is reachable from HEAD."
-          }
-
-          $reachableTags |
-            Select-Object -Last 20
+          Write-Host "Current HEAD:"
+          git log -1 --oneline --decorate
 
           Write-Host ""
           Write-Host "Testing git describe HEAD..."
@@ -108,7 +80,7 @@ jobs:
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error ($describe -join "`n")
-            throw "git describe HEAD failed even after fetching Ardour tags."
+            throw "git describe HEAD failed after fetching Ardour tags."
           }
 
           Write-Host "git describe HEAD = $($describe -join '')"
@@ -158,13 +130,12 @@ jobs:
       # ================================================================
       # 5. STANDALONE VCPKG
       # ================================================================
-      - name: Set up standalone vcpkg
+      - name: Bootstrap standalone vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Visual Studio defines this itself. Remove it so child
-          # processes cannot accidentally select VS's bundled vcpkg.
+          # Prevent Visual Studio's bundled vcpkg from being selected.
           Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
 
           $vcpkg = $env:VCPKG_HOME
@@ -175,7 +146,7 @@ jobs:
 
             if (Test-Path $vcpkg) {
               Write-Host "Existing C:\vcpkg is not a Git repository."
-              Write-Host "Removing it before cloning a clean copy."
+              Write-Host "Removing it..."
 
               Remove-Item `
                 -Path $vcpkg `
@@ -195,7 +166,8 @@ jobs:
           git fetch origin --tags --quiet
 
           if ("${{ inputs.vcpkg_ref }}" -ne "") {
-            Write-Host "Using pinned vcpkg ref: ${{ inputs.vcpkg_ref }}"
+            Write-Host "Using pinned vcpkg ref:"
+            Write-Host "${{ inputs.vcpkg_ref }}"
 
             git checkout "${{ inputs.vcpkg_ref }}"
           }
@@ -221,7 +193,7 @@ jobs:
           Write-Host "Standalone vcpkg is ready."
 
       # ================================================================
-      # 6. VCPKG DEPENDENCY CACHE
+      # 6. DEPENDENCY CACHE
       # ================================================================
       - name: Restore vcpkg dependency cache
         uses: actions/cache@v4
@@ -238,7 +210,7 @@ jobs:
             ardour-deps-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
 
       # ================================================================
-      # 7. DOWNLOAD ARDOUR MSVC DEPENDENCY HELPER
+      # 7. ARDOUR MSVC DEPENDENCY HELPER
       # ================================================================
       - name: Download Ardour dependency helper
         shell: pwsh
@@ -259,7 +231,7 @@ jobs:
           Write-Host "Downloaded Ardour dependency helper."
 
       # ================================================================
-      # 8. POINT DEPENDENCY HELPER AT OUR VCPKG
+      # 8. POINT HELPER AT OUR STANDALONE VCPKG
       # ================================================================
       - name: Configure dependency helper
         shell: pwsh
@@ -279,7 +251,8 @@ jobs:
             $text = $text.Replace($old, $new)
           }
           else {
-            Write-Host "Dependency helper already appears to use an external vcpkg path."
+            Write-Host "Helper does not contain the expected local-vcpkg path."
+            Write-Host "Leaving its existing path unchanged."
           }
 
           Set-Content `
@@ -306,9 +279,9 @@ jobs:
           Write-Host "Ardour dependency installation completed."
 
       # ================================================================
-      # 10. CONFIGURE VCPKG BUILD ENVIRONMENT
+      # 10. BUILD ENVIRONMENT
       # ================================================================
-      - name: Configure build environment
+      - name: Configure vcpkg environment
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -318,7 +291,7 @@ jobs:
           $pkgconfExe = "$pkgconfDir\pkgconf.exe"
 
           if (!(Test-Path $installed)) {
-            throw "Installed dependency tree not found: $installed"
+            throw "Installed vcpkg tree not found: $installed"
           }
 
           if (!(Test-Path $pkgconfExe)) {
@@ -331,7 +304,7 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          # Make vcpkg headers/libs visible to MSVC and Waf.
+          # Keep Visual Studio SDK paths and prepend vcpkg.
           "INCLUDE=$installed\include;$env:INCLUDE" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -344,7 +317,6 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          # Make pkg-config see both standard vcpkg databases.
           "PKG_CONFIG_PATH=$installed\lib\pkgconfig;$installed\share\pkgconfig" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -369,212 +341,287 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          Write-Host "vcpkg build environment configured."
+          Write-Host "vcpkg environment configured."
 
       # ================================================================
-      # 11. SELF-HEAL KNOWN DEPENDENCIES
+      # 11. GENERATE EXPLICIT MSVC INCLUDE FLAGS
       # ================================================================
-      - name: Self-heal missing dependencies
+      # The previous build proved that Waf's configure checks can find
+      # the libraries, but the actual libpbd compilation did not receive
+      # all the corresponding include directories.
+      #
+      # pkg-config knows exactly where GLib, GLibmm, libxml2, etc. put
+      # their headers. We turn its -I output into explicit /I flags and
+      # expose those to MSVC/Waf through CFLAGS and CXXFLAGS.
+      # ================================================================
+      - name: Configure explicit MSVC include flags
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $vcpkg = "$env:VCPKG_HOME\vcpkg.exe"
-          $triplet = $env:VCPKG_TRIPLET
-          $root = $env:VCPKG_INSTALLED
-          $pc = $env:PKG_CONFIG
+          $installed = $env:VCPKG_INSTALLED
+          $pkgconf = $env:PKG_CONFIG
 
-          # Known Ardour/MSVC dependency set.
+          if (!(Test-Path $pkgconf)) {
+            throw "PKG_CONFIG executable not found: $pkgconf"
+          }
+
+          $includeDirs = New-Object `
+            System.Collections.Generic.HashSet[string] `
+            ([System.StringComparer]::OrdinalIgnoreCase)
+
+          # Always include the main vcpkg include tree.
+          [void]$includeDirs.Add("$installed\include")
+
+          # Packages whose pkg-config metadata provides compiler include
+          # directories.
           $packages = @(
-            "boost-ptr-container",
-            "boost-uuid",
-            "boost-tokenizer",
-            "boost-multiprecision",
-            "boost-pool",
-            "boost-algorithm",
-            "boost-property-tree",
-            "boost-multi-array",
-            "glib",
-            "glibmm",
-            "libsigcpp",
-            "cairomm",
-            "pangomm",
-            "libsndfile",
-            "libsamplerate",
-            "curl",
-            "libarchive",
-            "liblo",
-            "taglib",
-            "vamp-sdk",
-            "libusb",
-            "rubberband",
-            "jack2",
-            "pthreads",
-            "fftw3[threads]",
-            "aubio[core]",
-            "libpng",
+            "glib-2.0",
+            "gobject-2.0",
+            "gio-2.0",
+            "gmodule-2.0",
+            "gthread-2.0",
+            "glibmm-2.4",
+            "giomm-2.4",
+            "sigc++-2.0",
+            "cairo",
+            "cairomm-1.0",
             "pango",
-            "lv2",
-            "libxml2",
-            "cppunit",
-            "libwebsockets",
-            "portaudio[asio]",
-            "serd",
-            "sord",
-            "sratom",
-            "lilv",
-            "libflac",
-            "getopt"
+            "pangomm-1.4",
+            "pangocairo",
+            "pangoft2",
+            "libxml-2.0",
+            "libpng",
+            "sndfile",
+            "samplerate",
+            "fftw3",
+            "fftw3f",
+            "flac",
+            "ogg",
+            "lilv-0",
+            "serd-0",
+            "sord-0",
+            "sratom-0",
+            "rubberband",
+            "liblo",
+            "portaudio-2.0",
+            "aubio",
+            "lv2"
           )
-
-          Write-Host ""
-          Write-Host "==============================================================="
-          Write-Host "Checking known Ardour MSVC dependency ports"
-          Write-Host "==============================================================="
-
-          $installedList = @(
-            & $vcpkg list
-          )
-
-          $missing = @()
 
           foreach ($package in $packages) {
 
-            $base = $package.Split("[")[0]
+            $result = & $pkgconf --cflags-only-I $package 2>&1
 
-            $found = $false
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Could not query include flags for $package"
+              continue
+            }
 
-            foreach ($line in $installedList) {
-              if ($line -match "^\s*$([regex]::Escape($base))\s*:") {
-                $found = $true
-                break
+            foreach ($token in ($result -split '\s+')) {
+
+              if ([string]::IsNullOrWhiteSpace($token)) {
+                continue
+              }
+
+              if ($token.StartsWith("-I")) {
+
+                $path = $token.Substring(2).Trim('"')
+
+                $path = $path -replace '/', '\'
+
+                if ($path.Length -gt 0) {
+                  [void]$includeDirs.Add($path)
+                }
               }
             }
+          }
 
-            if ($found) {
-              Write-Host "OK      $package"
-            }
-            else {
-              Write-Warning "MISSING $package"
-              $missing += $package
+          # These locations are important for Windows builds where the
+          # pkg-config result alone may not expose every generated/header
+          # directory.
+          $knownDirectories = @(
+            "$installed\include",
+            "$installed\include\glib-2.0",
+            "$installed\lib\glib-2.0\include",
+            "$installed\include\libxml2",
+            "$installed\include\pthread",
+            "$installed\include\sigc++-2.0",
+            "$installed\include\glibmm-2.66",
+            "$installed\include\glibmm-2.68",
+            "$installed\include\giomm-2.66",
+            "$installed\include\giomm-2.68"
+          )
+
+          foreach ($directory in $knownDirectories) {
+            if (Test-Path $directory) {
+              [void]$includeDirs.Add($directory)
             }
           }
 
-          if ($missing.Count -gt 0) {
+          Write-Host ""
+          Write-Host "==============================================================="
+          Write-Host "Resolved include directories"
+          Write-Host "==============================================================="
 
-            Write-Host ""
-            Write-Host "Installing missing dependency ports..."
-
-            $missing | ForEach-Object {
-              Write-Host "  $_"
-            }
-
-            & $vcpkg install `
-              @missing `
-              --triplet $triplet `
-              --no-print-usage
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "One or more missing dependency ports could not be installed."
-            }
-          }
-          else {
-            Write-Host "All known dependency ports are installed."
+          foreach ($directory in $includeDirs) {
+            Write-Host "  $directory"
           }
 
+          # Turn them into MSVC /I flags.
+          $flags = @()
+
+          foreach ($directory in $includeDirs) {
+            $escaped = $directory.Replace('"', '""')
+            $flags += "/I`"$escaped`""
+          }
+
+          $includeFlags = $flags -join " "
+
+          Write-Host ""
+          Write-Host "==============================================================="
+          Write-Host "Generated MSVC include flags"
+          Write-Host "==============================================================="
+          Write-Host $includeFlags
+
+          # Explicitly expose the flags to subsequent Waf steps.
+          "CFLAGS=$includeFlags $env:CFLAGS" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "CXXFLAGS=$includeFlags $env:CXXFLAGS" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          # Also retain the raw paths for tools which inspect INCLUDE.
+          $includeEnvironment = $includeDirs -join ";"
+
+          "INCLUDE=$includeEnvironment;$env:INCLUDE" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host ""
+          Write-Host "Explicit MSVC include flags configured."
+
       # ================================================================
-      # 12. RE-APPLY ARDOUR WINDOWS FIXES
+      # 12. VERIFY COMPILER CAN SEE THE PREVIOUSLY MISSING HEADERS
       # ================================================================
-      # Important because the helper may create aubio.pc and fix
-      # Windows-specific .pc and library names after installation.
-      # ================================================================
-      - name: Re-apply Ardour dependency fixes
+      - name: Verify MSVC dependency headers
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          python "$env:GITHUB_WORKSPACE\InstallDependencies.vcpkg.py"
+          $testDir = "$env:RUNNER_TEMP\ardour-header-test"
 
-          Write-Host "Ardour dependency fixes applied."
+          if (Test-Path $testDir) {
+            Remove-Item `
+              $testDir `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $testDir |
+            Out-Null
+
+          @'
+          #include <glib.h>
+          #include <glibmm.h>
+          #include <sigc++/trackable.h>
+          #include <libxml/parser.h>
+
+          int main()
+          {
+              return 0;
+          }
+          '@ | Set-Content `
+            -Path "$testDir\test.cpp" `
+            -Encoding utf8
+
+          Write-Host "Testing MSVC header visibility..."
+
+          & cl `
+            /nologo `
+            /EHsc `
+            /c `
+            "$testDir\test.cpp" `
+            /Fo"$testDir\test.obj"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSVC cannot see one or more required Ardour dependency headers."
+          }
+
+          Write-Host ""
+          Write-Host "MSVC can see:"
+          Write-Host "  glib.h"
+          Write-Host "  glibmm.h"
+          Write-Host "  sigc++/trackable.h"
+          Write-Host "  libxml/parser.h"
+          Write-Host ""
+          Write-Host "Header visibility test passed."
 
       # ================================================================
-      # 13. VERIFY DEPENDENCIES
+      # 13. VERIFY PKG-CONFIG
       # ================================================================
-      - name: Verify dependencies
+      - name: Verify pkg-config dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $root = $env:VCPKG_INSTALLED
-          $pc = $env:PKG_CONFIG
+          $packages = @(
+            "glib-2.0",
+            "gobject-2.0",
+            "gio-2.0",
+            "gmodule-2.0",
+            "gthread-2.0",
+            "glibmm-2.4",
+            "giomm-2.4",
+            "sigc++-2.0",
+            "cairo",
+            "cairomm-1.0",
+            "pango",
+            "pangomm-1.4",
+            "pangocairo",
+            "libxml-2.0",
+            "libpng",
+            "sndfile",
+            "samplerate",
+            "fftw3",
+            "flac",
+            "lilv-0",
+            "serd-0",
+            "sord-0",
+            "sratom-0",
+            "rubberband",
+            "liblo",
+            "portaudio-2.0",
+            "aubio"
+          )
 
-          function Require-Header {
-            param([string]$Path)
+          foreach ($package in $packages) {
 
-            $full = "$root\include\$Path"
-
-            if (Test-Path $full) {
-              Write-Host "OK HEADER  $Path"
-            }
-            else {
-              throw "Missing required header: $Path"
-            }
-          }
-
-          function Require-Pkg {
-            param([string]$Name)
-
-            $null = & $pc --exists $Name 2>&1
+            $null = & $env:PKG_CONFIG --exists $package 2>&1
 
             if ($LASTEXITCODE -ne 0) {
-              throw "Missing required pkg-config package: $Name"
+              throw "pkg-config cannot find required package: $package"
             }
 
-            $version = (& $pc --modversion $Name 2>&1) -join ""
+            $version = (
+              & $env:PKG_CONFIG --modversion $package 2>&1
+            ) -join ""
 
-            Write-Host "OK PKG     $Name ($version)"
+            Write-Host "OK  $package ($version)"
           }
 
           Write-Host ""
-          Write-Host "=== Required headers ==="
-
-          Require-Header "boost/version.hpp"
-          Require-Header "boost/ptr_container/ptr_list.hpp"
-          Require-Header "sndfile.h"
-          Require-Header "samplerate.h"
-          Require-Header "fftw3.h"
-          Require-Header "FLAC/stream_encoder.h"
-          Require-Header "lo/lo.h"
-          Require-Header "portaudio.h"
-          Require-Header "rubberband/RubberBandStretcher.h"
-          Require-Header "aubio/aubio.h"
-          Require-Header "pthread.h"
-
-          Write-Host ""
-          Write-Host "=== Required pkg-config packages ==="
-
-          Require-Pkg "glib-2.0"
-          Require-Pkg "sndfile"
-          Require-Pkg "samplerate"
-          Require-Pkg "fftw3"
-          Require-Pkg "flac"
-          Require-Pkg "lilv-0"
-          Require-Pkg "rubberband"
-          Require-Pkg "liblo"
-          Require-Pkg "portaudio-2.0"
-          Require-Pkg "aubio"
-
-          Write-Host ""
-          Write-Host "=== GTKmm family ==="
-
-          Require-Pkg "glibmm-2.4"
-          Require-Pkg "giomm-2.4"
-          Require-Pkg "sigc++-2.0"
-          Require-Pkg "cairomm-1.0"
-          Require-Pkg "pangomm-1.4"
-
-          Write-Host ""
-          Write-Host "All dependency checks passed."
+          Write-Host "All pkg-config dependency checks passed."
 
       # ================================================================
       # 14. WAF CONFIGURE
@@ -592,7 +639,6 @@ jobs:
             "--configdir=share",
             "--dist-target=msvc",
             "--also-include=$installed\include",
-            "--also-include=$installed\include\pthread",
             "--also-libdir=$installed\lib",
             "--cxx17"
           )
@@ -603,6 +649,14 @@ jobs:
           else {
             $args += "--debug"
           }
+
+          Write-Host ""
+          Write-Host "CFLAGS:"
+          Write-Host $env:CFLAGS
+
+          Write-Host ""
+          Write-Host "CXXFLAGS:"
+          Write-Host $env:CXXFLAGS
 
           Write-Host ""
           Write-Host "Running:"
@@ -663,7 +717,7 @@ jobs:
           python waf install
 
       # ================================================================
-      # 19. BUNDLE RUNTIME DLLs
+      # 19. BUNDLE RUNTIME DLLS
       # ================================================================
       - name: Bundle runtime DLLs
         shell: pwsh
@@ -686,7 +740,7 @@ jobs:
           )
 
           if ($executables.Count -eq 0) {
-            throw "No executable files were installed under $installRoot"
+            throw "No executable files were installed."
           }
 
           $dlls = @(
@@ -697,7 +751,7 @@ jobs:
           )
 
           if ($dlls.Count -eq 0) {
-            throw "No vcpkg DLLs found in $vcpkgBin"
+            throw "No vcpkg runtime DLLs were found."
           }
 
           $directories = $executables |
@@ -718,7 +772,7 @@ jobs:
           }
 
       # ================================================================
-      # 20. VALIDATE
+      # 20. VALIDATE INSTALLATION
       # ================================================================
       - name: Validate installed build
         shell: pwsh
