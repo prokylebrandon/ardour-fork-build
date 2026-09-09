@@ -19,9 +19,6 @@ on:
         type: string
 
 env:
-  # IMPORTANT:
-  # Do not use VCPKG_ROOT. Visual Studio on the GitHub runner may
-  # define VCPKG_ROOT itself and point it at its bundled vcpkg.
   VCPKG_HOME: C:\vcpkg
   VCPKG_TRIPLET: x64-windows
   INSTALL_DIR: ${{ github.workspace }}\dist
@@ -45,10 +42,6 @@ jobs:
 
       # ================================================================
       # 2. FETCH ARDOUR UPSTREAM TAGS
-      # ================================================================
-      # Ardour's wscript uses git describe HEAD for version information.
-      # A fork may have full history without having the official tags.
-      # Fetch them explicitly.
       # ================================================================
       - name: Fetch Ardour upstream tags
         shell: pwsh
@@ -135,7 +128,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Prevent Visual Studio's bundled vcpkg from being selected.
+          # Visual Studio may set VCPKG_ROOT to its own bundled copy.
+          # We deliberately do not use that variable.
           Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
 
           $vcpkg = $env:VCPKG_HOME
@@ -166,14 +160,11 @@ jobs:
           git fetch origin --tags --quiet
 
           if ("${{ inputs.vcpkg_ref }}" -ne "") {
-            Write-Host "Using pinned vcpkg ref:"
-            Write-Host "${{ inputs.vcpkg_ref }}"
-
+            Write-Host "Using pinned vcpkg ref: ${{ inputs.vcpkg_ref }}"
             git checkout "${{ inputs.vcpkg_ref }}"
           }
           else {
             Write-Host "Using latest vcpkg master"
-
             git checkout master --quiet
             git pull --ff-only origin master
           }
@@ -193,7 +184,7 @@ jobs:
           Write-Host "Standalone vcpkg is ready."
 
       # ================================================================
-      # 6. DEPENDENCY CACHE
+      # 6. VCPKG DEPENDENCY CACHE
       # ================================================================
       - name: Restore vcpkg dependency cache
         uses: actions/cache@v4
@@ -210,7 +201,7 @@ jobs:
             ardour-deps-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
 
       # ================================================================
-      # 7. ARDOUR MSVC DEPENDENCY HELPER
+      # 7. DOWNLOAD ARDOUR MSVC DEPENDENCY HELPER
       # ================================================================
       - name: Download Ardour dependency helper
         shell: pwsh
@@ -252,7 +243,6 @@ jobs:
           }
           else {
             Write-Host "Helper does not contain the expected local-vcpkg path."
-            Write-Host "Leaving its existing path unchanged."
           }
 
           Set-Content `
@@ -279,7 +269,7 @@ jobs:
           Write-Host "Ardour dependency installation completed."
 
       # ================================================================
-      # 10. BUILD ENVIRONMENT
+      # 10. CONFIGURE VCPKG ENVIRONMENT
       # ================================================================
       - name: Configure vcpkg environment
         shell: pwsh
@@ -304,7 +294,6 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          # Keep Visual Studio SDK paths and prepend vcpkg.
           "INCLUDE=$installed\include;$env:INCLUDE" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -346,14 +335,6 @@ jobs:
       # ================================================================
       # 11. GENERATE EXPLICIT MSVC INCLUDE FLAGS
       # ================================================================
-      # The previous build proved that Waf's configure checks can find
-      # the libraries, but the actual libpbd compilation did not receive
-      # all the corresponding include directories.
-      #
-      # pkg-config knows exactly where GLib, GLibmm, libxml2, etc. put
-      # their headers. We turn its -I output into explicit /I flags and
-      # expose those to MSVC/Waf through CFLAGS and CXXFLAGS.
-      # ================================================================
       - name: Configure explicit MSVC include flags
         shell: pwsh
         run: |
@@ -370,11 +351,9 @@ jobs:
             System.Collections.Generic.HashSet[string] `
             ([System.StringComparer]::OrdinalIgnoreCase)
 
-          # Always include the main vcpkg include tree.
           [void]$includeDirs.Add("$installed\include")
 
-          # Packages whose pkg-config metadata provides compiler include
-          # directories.
+          # Query pkg-config for package-specific include directories.
           $packages = @(
             "glib-2.0",
             "gobject-2.0",
@@ -406,7 +385,8 @@ jobs:
             "liblo",
             "portaudio-2.0",
             "aubio",
-            "lv2"
+            "lv2",
+            "libusb-1.0"
           )
 
           foreach ($package in $packages) {
@@ -437,14 +417,17 @@ jobs:
             }
           }
 
-          # These locations are important for Windows builds where the
-          # pkg-config result alone may not expose every generated/header
-          # directory.
+          # Explicit known include locations for Windows/vcpkg layouts.
           $knownDirectories = @(
             "$installed\include",
             "$installed\include\glib-2.0",
             "$installed\lib\glib-2.0\include",
             "$installed\include\libxml2",
+
+            # FIX:
+            # vcpkg/libusb places libusb.h under include\libusb-1.0.
+            "$installed\include\libusb-1.0",
+
             "$installed\include\pthread",
             "$installed\include\sigc++-2.0",
             "$installed\include\glibmm-2.66",
@@ -468,7 +451,6 @@ jobs:
             Write-Host "  $directory"
           }
 
-          # Turn them into MSVC /I flags.
           $flags = @()
 
           foreach ($directory in $includeDirs) {
@@ -484,7 +466,6 @@ jobs:
           Write-Host "==============================================================="
           Write-Host $includeFlags
 
-          # Explicitly expose the flags to subsequent Waf steps.
           "CFLAGS=$includeFlags $env:CFLAGS" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -497,7 +478,6 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          # Also retain the raw paths for tools which inspect INCLUDE.
           $includeEnvironment = $includeDirs -join ";"
 
           "INCLUDE=$includeEnvironment;$env:INCLUDE" |
@@ -507,10 +487,10 @@ jobs:
               -Append
 
           Write-Host ""
-          Write-Host "Explicit MSVC include flags configured."
+          Write-Host "MSVC include flags configured."
 
       # ================================================================
-      # 12. VERIFY COMPILER CAN SEE THE PREVIOUSLY MISSING HEADERS
+      # 12. VERIFY IMPORTANT MSVC HEADERS
       # ================================================================
       - name: Verify MSVC dependency headers
         shell: pwsh
@@ -536,6 +516,7 @@ jobs:
           #include <glibmm.h>
           #include <sigc++/trackable.h>
           #include <libxml/parser.h>
+          #include <libusb.h>
 
           int main()
           {
@@ -545,7 +526,7 @@ jobs:
             -Path "$testDir\test.cpp" `
             -Encoding utf8
 
-          Write-Host "Testing MSVC header visibility..."
+          Write-Host "Testing MSVC dependency headers..."
 
           & cl `
             /nologo `
@@ -559,13 +540,12 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "MSVC can see:"
+          Write-Host "Header visibility test passed."
           Write-Host "  glib.h"
           Write-Host "  glibmm.h"
           Write-Host "  sigc++/trackable.h"
           Write-Host "  libxml/parser.h"
-          Write-Host ""
-          Write-Host "Header visibility test passed."
+          Write-Host "  libusb.h"
 
       # ================================================================
       # 13. VERIFY PKG-CONFIG
@@ -649,14 +629,6 @@ jobs:
           else {
             $args += "--debug"
           }
-
-          Write-Host ""
-          Write-Host "CFLAGS:"
-          Write-Host $env:CFLAGS
-
-          Write-Host ""
-          Write-Host "CXXFLAGS:"
-          Write-Host $env:CXXFLAGS
 
           Write-Host ""
           Write-Host "Running:"
@@ -772,7 +744,7 @@ jobs:
           }
 
       # ================================================================
-      # 20. VALIDATE INSTALLATION
+      # 20. VALIDATE
       # ================================================================
       - name: Validate installed build
         shell: pwsh
