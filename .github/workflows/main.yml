@@ -1,26 +1,28 @@
+```yaml
 name: Build Ardour (Windows / MSVC)
 
-# Manual-trigger only; no automatic runs on push or PR.
 on:
   workflow_dispatch:
     inputs:
       build_type:
-        description: "waf build type (controls --optimize vs --debug)"
+        description: "waf build type"
         required: true
         default: "Release"
         type: choice
         options:
           - Release
           - Debug
+
       vcpkg_ref:
-        description: "vcpkg commit/tag to pin (blank = follow master)"
+        description: "vcpkg commit/tag to pin (blank = latest)"
         required: false
         default: ""
+        type: string
 
 env:
+  VCPKG_HOME: C:\vcpkg
   VCPKG_TRIPLET: x64-windows
-  VCPKG_ROOT:    C:\vcpkg
-  INSTALL_DIR:   ${{ github.workspace }}\dist
+  INSTALL_DIR: ${{ github.workspace }}\dist
 
 jobs:
   build:
@@ -31,9 +33,6 @@ jobs:
       # ================================================================
       # 1. SOURCE
       # ================================================================
-      # blobless partial clone: fetches every commit and tag (git describe
-      # in wscript needs them for the version string) but skips the
-      # historical file blobs that dominate Ardour's transfer cost.
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -49,54 +48,97 @@ jobs:
         with:
           python-version: "3.x"
 
-      # Puts cl.exe / link.exe / ml64.exe on PATH and populates the
-      # INCLUDE / LIB / LIBPATH env vars for the VS toolchain.
-      # The "Configure build environment" step later PREPENDS vcpkg paths
-      # to INCLUDE and LIB so vcpkg headers take priority over VS-SDK
-      # equivalents where both exist.
-      - name: Set up MSVC dev environment
+      - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Ardour's wscript uses llvm-nm to produce .def export files for
-      # symbols that MSVC cannot auto-export from shared libraries.
-      - name: Install LLVM (for llvm-nm)
+      - name: Install LLVM
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "18"
 
-      # windows-2022 ships Strawberry Perl but does not guarantee it is
-      # on PATH for every shell invocation.
       - name: Ensure Strawberry Perl is on PATH
-        run: echo "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
         shell: pwsh
+        run: |
+          if (Test-Path "C:\Strawberry\perl\bin") {
+            "C:\Strawberry\perl\bin" | Out-File `
+              -FilePath $env:GITHUB_PATH `
+              -Encoding utf8 `
+              -Append
+          }
 
       # ================================================================
-      # 3. VCPKG PACKAGE LIST
+      # 3. VCPKG TOOL CACHE
       # ================================================================
-      # This file is the single source of truth for what vcpkg installs.
-      # Its hash drives the installed-packages cache key (see below), so
-      # adding or removing a package automatically busts the right entry.
-      #
-      # Packages NOT listed here compared to a naive first draft:
-      #
-      #   glib   — transitive dependency of glibmm; vcpkg resolves it.
-      #
-      #   gtkmm  — Ardour 8.x ships its own GTK2 C fork (libs/tk/ytk)
-      #            and its own C++ wrappers (ztkmm, ydkmm) compiled from
-      #            source.  An external gtkmm from vcpkg declares the same
-      #            symbols and produces link conflicts.
-      #
-      # Packages that MAY be absent at certain vcpkg pins:
-      #
-      #   aubio  — was removed from vcpkg mainline temporarily.  Run
-      #            `vcpkg search aubio` at your chosen ref, or supply an
-      #            --overlay-ports directory with a custom port.
-      #
-      #   liblo  — present in recent mainline but worth verifying at the
-      #            exact ref you pin.
+      - name: Restore vcpkg tool cache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg
+          key: vcpkg-tool-${{ runner.os }}-${{ inputs.vcpkg_ref != '' && inputs.vcpkg_ref || 'latest' }}
+          restore-keys: |
+            vcpkg-tool-${{ runner.os }}-
+
+      # ================================================================
+      # 4. SET UP STANDALONE VCPKG
+      # ================================================================
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vcpkg = "C:\vcpkg"
+
+          Write-Host "Using standalone vcpkg at: $vcpkg"
+
+          # Never trust the runner's VCPKG_ROOT environment variable.
+          # Visual Studio may set it to its own bundled vcpkg.
+          Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
+
+          if (!(Test-Path "$vcpkg\.git")) {
+
+            if (Test-Path $vcpkg) {
+              Write-Host "Existing C:\vcpkg is not a Git repository. Removing it..."
+              Remove-Item $vcpkg -Recurse -Force
+            }
+
+            Write-Host "Cloning standalone vcpkg..."
+            git clone https://github.com/microsoft/vcpkg.git $vcpkg
+          }
+
+          Push-Location $vcpkg
+
+          git fetch origin --tags --quiet
+
+          if ("${{ inputs.vcpkg_ref }}" -ne "") {
+            Write-Host "Checking out pinned vcpkg ref: ${{ inputs.vcpkg_ref }}"
+            git checkout "${{ inputs.vcpkg_ref }}"
+          }
+          else {
+            Write-Host "Using latest vcpkg master"
+            git checkout master --quiet
+            git pull --ff-only origin master
+          }
+
+          Pop-Location
+
+          if (!(Test-Path "$vcpkg\bootstrap-vcpkg.bat")) {
+            throw "bootstrap-vcpkg.bat was not found at $vcpkg"
+          }
+
+          & "$vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+          if (!(Test-Path "$vcpkg\vcpkg.exe")) {
+            throw "vcpkg.exe was not created."
+          }
+
+          Write-Host "vcpkg is ready."
+
+      # ================================================================
+      # 5. PACKAGE LIST
+      # ================================================================
       - name: Write vcpkg package manifest
+        shell: pwsh
         run: |
           @'
           boost
@@ -121,256 +163,274 @@ jobs:
           pthreads
           portaudio
           '@ | Set-Content -Path vcpkg-packages.txt
-        shell: pwsh
 
       # ================================================================
-      # 4. VCPKG TOOL CACHE
+      # 6. DEPENDENCY CACHE
       # ================================================================
-      # Caches the cloned repo and compiled vcpkg.exe separately from
-      # the installed packages.  Using run_id as the key suffix for
-      # floating-ref runs guarantees a fresh cache save each run while
-      # the restore-key still seeds from the nearest prior entry, so
-      # Bootstrap only needs a fast incremental git pull instead of a
-      # full clone.
-      - name: Restore vcpkg tool cache
+      - name: Restore vcpkg dependency cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.VCPKG_ROOT }}
-          key: vcpkg-tool-${{ runner.os }}-${{ inputs.vcpkg_ref != '' && inputs.vcpkg_ref || github.run_id }}
-          restore-keys: |
-            vcpkg-tool-${{ runner.os }}-
-
-      - name: Bootstrap vcpkg
-        run: |
-          if (!(Test-Path $env:VCPKG_ROOT)) {
-            git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
-          }
-          Push-Location $env:VCPKG_ROOT
-          git fetch origin --tags --quiet
-          if ("${{ inputs.vcpkg_ref }}" -ne "") {
-            git checkout "${{ inputs.vcpkg_ref }}"
-          } else {
-            git checkout master --quiet
-            git pull --ff-only origin master
-          }
-          Pop-Location
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
-        shell: pwsh
-
-      # ================================================================
-      # 5. VCPKG INSTALLED-PACKAGES CACHE
-      # ================================================================
-      # The key includes both the package-list hash AND the vcpkg ref so
-      # that switching between floating master and a pinned commit
-      # invalidates the cache rather than silently reusing packages built
-      # against a different tool version (which can cause subtle ABI
-      # mismatches at link time).
-      #
-      # vcpkg install is always run even on a full cache hit.  It is a
-      # no-op for already-consistent packages but will automatically
-      # rebuild anything whose ABI hash is stale relative to the current
-      # tool version — preventing silent linker failures without forcing
-      # a full reinstall every run.
-      - name: Restore vcpkg installed-packages cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.VCPKG_ROOT }}\installed
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\packages
+            C:\vcpkg\downloads
           key: >-
-            vcpkg-installed-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('vcpkg-packages.txt') }}-${{ inputs.vcpkg_ref != '' && inputs.vcpkg_ref || 'floating' }}
+            ardour-vcpkg-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
+            ${{ hashFiles('vcpkg-packages.txt') }}-
+            ${{ inputs.vcpkg_ref != '' && inputs.vcpkg_ref || 'floating' }}
           restore-keys: |
-            vcpkg-installed-${{ env.VCPKG_TRIPLET }}-${{ hashFiles('vcpkg-packages.txt') }}-
-            vcpkg-installed-${{ env.VCPKG_TRIPLET }}-
+            ardour-vcpkg-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
 
+      # ================================================================
+      # 7. INSTALL DEPENDENCIES
+      # ================================================================
       - name: Install dependencies via vcpkg
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $packages = Get-Content vcpkg-packages.txt |
-            Where-Object { $_.Trim() -ne '' }
-          & "$env:VCPKG_ROOT\vcpkg.exe" install @packages `
+            Where-Object { $_.Trim() -ne "" }
+
+          & "C:\vcpkg\vcpkg.exe" install @packages `
             --triplet $env:VCPKG_TRIPLET `
             --no-print-usage
-        shell: pwsh
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg dependency installation failed."
+          }
 
       # ================================================================
-      # 6. BUILD ENVIRONMENT
+      # 8. BUILD ENVIRONMENT
       # ================================================================
-      # Sets the variables that all subsequent steps depend on.
-      #
-      # VCPKG_INSTALLED  — convenience shorthand; avoids recomputing the
-      #   path in every step.
-      #
-      # INCLUDE / LIB    — cl.exe searches these for headers and import
-      #   libs that have no .pc file.  The most important case is boost:
-      #   vcpkg's boost umbrella package does not install boost.pc, so
-      #   the only way waf's boost probe finds boost/version.hpp is via
-      #   INCLUDE.  We PREPEND rather than replace so the VS toolchain's
-      #   own system headers remain reachable.
-      #
-      # PKG_CONFIG_PATH  — two directories where vcpkg installs .pc files:
-      #     lib\pkgconfig    compiled libraries (sndfile, glib, cairomm…)
-      #     share\pkgconfig  data/header-only packages (lv2, etc.)
-      #
-      # PKG_CONFIG       — explicit path to pkgconf.exe.  Waf reads this
-      #   variable and uses it in place of searching PATH for "pkg-config".
-      #   We also copy pkgconf.exe → pkg-config.exe so that any tool which
-      #   bypasses PKG_CONFIG and looks for a name in PATH still finds the
-      #   right binary.
       - name: Configure build environment
+        shell: pwsh
         run: |
-          $installed  = "$env:VCPKG_ROOT\installed\$env:VCPKG_TRIPLET"
+          $ErrorActionPreference = "Stop"
+
+          $installed = "C:\vcpkg\installed\$env:VCPKG_TRIPLET"
           $pkgconfDir = "$installed\tools\pkgconf"
           $pkgconfExe = "$pkgconfDir\pkgconf.exe"
 
-          # Expose VCPKG_INSTALLED to all later steps via GITHUB_ENV
-          echo "VCPKG_INSTALLED=$installed"                                           >> $env:GITHUB_ENV
-
-          # Compiler header / library paths (prepend; do not replace VS paths)
-          echo "INCLUDE=$installed\include;$env:INCLUDE"                              >> $env:GITHUB_ENV
-          echo "LIB=$installed\lib;$env:LIB"                                         >> $env:GITHUB_ENV
-
-          # pkg-config database (both standard vcpkg locations)
-          echo "PKG_CONFIG_PATH=$installed\lib\pkgconfig;$installed\share\pkgconfig" >> $env:GITHUB_ENV
-
-          # pkg-config executable
-          if (Test-Path $pkgconfExe) {
-            echo "PKG_CONFIG=$pkgconfExe" >> $env:GITHUB_ENV
-            # Alias so tools searching PATH by executable name also work
-            $alias = "$pkgconfDir\pkg-config.exe"
-            if (-not (Test-Path $alias)) { Copy-Item $pkgconfExe $alias }
-          } else {
-            Write-Warning "pkgconf.exe not found at $pkgconfExe — pkg-config may fail."
+          if (!(Test-Path $installed)) {
+            throw "vcpkg installed directory not found: $installed"
           }
 
-          echo "$installed\bin" >> $env:GITHUB_PATH
-          echo "$pkgconfDir"    >> $env:GITHUB_PATH
-        shell: pwsh
+          Write-Host "vcpkg installed tree: $installed"
+
+          # Make the path available to every later GitHub Actions step.
+          "VCPKG_INSTALLED=$installed" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Compiler search paths.
+          "INCLUDE=$installed\include;$env:INCLUDE" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "LIB=$installed\lib;$env:LIB" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # pkg-config databases.
+          "PKG_CONFIG_PATH=$installed\lib\pkgconfig;$installed\share\pkgconfig" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # pkgconf.
+          if (Test-Path $pkgconfExe) {
+            "PKG_CONFIG=$pkgconfExe" |
+              Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+            "$pkgconfDir" |
+              Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          else {
+            Write-Warning "pkgconf.exe not found at $pkgconfExe"
+          }
+
+          "$installed\bin" |
+            Out-File $env:GITHUB_PATH -Encoding utf8 -Append
 
       # ================================================================
-      # 7. WSCRIPT VERSION PATCHES
+      # 9. VERIFY BOOST
       # ================================================================
-      # Ardour's wscripts request the GTKmm-family C++ wrapper libraries
-      # by their legacy pkg-config names:
-      #     glibmm-2.4   giomm-2.4   sigc++-2.0   cairomm-1.0   pangomm-1.4
-      #
-      # Current vcpkg ships only the new-ABI versions under new names:
-      #     glibmm-2.68  giomm-2.68  sigc++-3.0   cairomm-1.16  pangomm-2.48
-      #
-      # Rather than unconditionally replacing all strings, we ask
-      # pkg-config which names are actually installed and patch only the
-      # wscript entries that need to change.  If a future vcpkg pin
-      # re-ships the old names, or if you supply a custom overlay port
-      # with them, no patch is applied and the original wscript is used
-      # as-is — which is correct.
-      #
-      # IMPORTANT CAVEAT: patching the pkg-config *name* fixes waf's
-      # configure probe, but it cannot fix C++ API differences between
-      # sigc++ 2.x and 3.x.  If libs/tk/ztkmm was authored against the
-      # 2.x API and vcpkg only ships 3.x, the build will still fail with
-      # compiler errors even after this patch.  Verify that your Ardour
-      # branch has been ported to sigc++ 3.x before relying on this step.
-      - name: Detect library API versions and patch wscripts
+      - name: Verify Boost
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:VCPKG_INSTALLED
+
+          $requiredHeaders = @(
+            "$root\include\boost\version.hpp",
+            "$root\include\boost\ptr_container\ptr_list.hpp"
+          )
+
+          foreach ($header in $requiredHeaders) {
+            if (!(Test-Path $header)) {
+              throw "Missing Boost header: $header"
+            }
+
+            Write-Host "FOUND: $header"
+          }
+
+          Write-Host ""
+          Write-Host "Boost version:"
+          Select-String `
+            -Path "$root\include\boost\version.hpp" `
+            -Pattern "BOOST_VERSION"
+
+          Write-Host ""
+          Write-Host "Boost libraries:"
+          Get-ChildItem "$root\lib" -Filter "*boost*.lib" |
+            Select-Object -First 20 |
+            ForEach-Object {
+              Write-Host "  $($_.Name)"
+            }
+
+      # ================================================================
+      # 10. DETECT GTKMM FAMILY
+      # ================================================================
+      - name: Detect library API versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
           $pc = $env:PKG_CONFIG
-          if (-not $pc -or -not (Test-Path $pc)) { $pc = "pkg-config" }
+
+          if (!$pc -or !(Test-Path $pc)) {
+            $pc = "pkg-config"
+          }
 
           function Find-PkgName {
             param([string[]] $Candidates)
+
             foreach ($name in $Candidates) {
               $null = & $pc --exists $name 2>&1
-              if ($LASTEXITCODE -eq 0) { return $name }
+
+              if ($LASTEXITCODE -eq 0) {
+                return $name
+              }
             }
+
             return $null
           }
 
-          $glibmmName  = Find-PkgName @('glibmm-2.68',  'glibmm-2.4')
-          $giommName   = Find-PkgName @('giomm-2.68',   'giomm-2.4')
-          $sigcName    = Find-PkgName @('sigc++-3.0',   'sigc++-2.0')
-          $cairommName = Find-PkgName @('cairomm-1.16', 'cairomm-1.0')
-          $pangommName = Find-PkgName @('pangomm-2.48', 'pangomm-1.4')
+          $glibmm  = Find-PkgName @("glibmm-2.68", "glibmm-2.4")
+          $giomm   = Find-PkgName @("giomm-2.68", "giomm-2.4")
+          $sigc    = Find-PkgName @("sigc++-3.0", "sigc++-2.0")
+          $cairomm = Find-PkgName @("cairomm-1.16", "cairomm-1.0")
+          $pangomm = Find-PkgName @("pangomm-2.48", "pangomm-1.4")
 
-          Write-Host "Detected pkg-config package names:"
-          Write-Host "  glibmm  = $(if ($glibmmName)  { $glibmmName  } else { '(not found)' })"
-          Write-Host "  giomm   = $(if ($giommName)   { $giommName   } else { '(not found)' })"
-          Write-Host "  sigc++  = $(if ($sigcName)    { $sigcName    } else { '(not found)' })"
-          Write-Host "  cairomm = $(if ($cairommName) { $cairommName } else { '(not found)' })"
-          Write-Host "  pangomm = $(if ($pangommName) { $pangommName } else { '(not found)' })"
+          Write-Host "Detected packages:"
+          Write-Host "  glibmm  = $glibmm"
+          Write-Host "  giomm   = $giomm"
+          Write-Host "  sigc++  = $sigc"
+          Write-Host "  cairomm = $cairomm"
+          Write-Host "  pangomm = $pangomm"
 
-          # ── top-level wscript (glibmm, giomm) ──────────────────────
+          if (!$glibmm -or !$giomm -or !$sigc -or !$cairomm -or !$pangomm) {
+            throw "One or more GTKmm-family pkg-config packages are missing."
+          }
+
+          # Top-level Ardour Waf script.
           $content = Get-Content wscript -Raw
-          if ($glibmmName -and $glibmmName -ne 'glibmm-2.4') {
-            $content = $content -replace [regex]::Escape('glibmm-2.4'), $glibmmName
+
+          if ($glibmm -and $glibmm -ne "glibmm-2.4") {
+            $content = $content -replace `
+              [regex]::Escape("glibmm-2.4"), `
+              $glibmm
           }
-          if ($giommName -and $giommName -ne 'giomm-2.4') {
-            $content = $content -replace [regex]::Escape('giomm-2.4'), $giommName
+
+          if ($giomm -and $giomm -ne "giomm-2.4") {
+            $content = $content -replace `
+              [regex]::Escape("giomm-2.4"), `
+              $giomm
           }
+
           Set-Content wscript $content -NoNewline
 
-          # ── libs/tk/ztkmm/wscript (sigc++) ─────────────────────────
-          if (Test-Path libs/tk/ztkmm/wscript) {
-            $ztk = Get-Content libs/tk/ztkmm/wscript -Raw
-            if ($sigcName -and $sigcName -ne 'sigc++-2.0') {
-              $ztk = $ztk -replace [regex]::Escape('sigc++-2.0'), $sigcName
+          if (Test-Path "libs/tk/ztkmm/wscript") {
+            $ztk = Get-Content "libs/tk/ztkmm/wscript" -Raw
+
+            if ($sigc -and $sigc -ne "sigc++-2.0") {
+              $ztk = $ztk -replace `
+                [regex]::Escape("sigc++-2.0"), `
+                $sigc
             }
-            Set-Content libs/tk/ztkmm/wscript $ztk -NoNewline
-          } else {
-            Write-Warning "libs/tk/ztkmm/wscript not found — skipping sigc++ patch."
+
+            Set-Content `
+              "libs/tk/ztkmm/wscript" `
+              $ztk `
+              -NoNewline
           }
 
-          # ── libs/tk/ydkmm/wscript (cairomm, pangomm) ───────────────
-          if (Test-Path libs/tk/ydkmm/wscript) {
-            $ydk = Get-Content libs/tk/ydkmm/wscript -Raw
-            if ($cairommName -and $cairommName -ne 'cairomm-1.0') {
-              $ydk = $ydk -replace [regex]::Escape('cairomm-1.0'), $cairommName
+          if (Test-Path "libs/tk/ydkmm/wscript") {
+            $ydk = Get-Content "libs/tk/ydkmm/wscript" -Raw
+
+            if ($cairomm -and $cairomm -ne "cairomm-1.0") {
+              $ydk = $ydk -replace `
+                [regex]::Escape("cairomm-1.0"), `
+                $cairomm
             }
-            if ($pangommName -and $pangommName -ne 'pangomm-1.4') {
-              $ydk = $ydk -replace [regex]::Escape('pangomm-1.4'), $pangommName
+
+            if ($pangomm -and $pangomm -ne "pangomm-1.4") {
+              $ydk = $ydk -replace `
+                [regex]::Escape("pangomm-1.4"), `
+                $pangomm
             }
-            Set-Content libs/tk/ydkmm/wscript $ydk -NoNewline
-          } else {
-            Write-Warning "libs/tk/ydkmm/wscript not found — skipping cairomm/pangomm patch."
+
+            Set-Content `
+              "libs/tk/ydkmm/wscript" `
+              $ydk `
+              -NoNewline
           }
-        shell: pwsh
 
       # ================================================================
-      # 8. PRE-CONFIGURE DEPENDENCY CHECK
+      # 11. PRE-CONFIGURE CHECK
       # ================================================================
-      # Verifies every important header and pkg-config package before waf
-      # runs configure.  All missing items are reported together so you
-      # don't have to iterate one failed probe at a time.  The step exits
-      # non-zero if anything is absent, failing the job here rather than
-      # inside a cryptic waf error.
       - name: Pre-configure dependency check
+        shell: pwsh
         run: |
-          $pc        = $env:PKG_CONFIG
-          if (-not $pc -or -not (Test-Path $pc)) { $pc = "pkg-config" }
-          $installed = $env:VCPKG_INSTALLED
-          $script:allOk = $true
+          $ErrorActionPreference = "Stop"
 
-          function Check-Header([string] $RelPath) {
-            if (Test-Path "$installed\include\$RelPath") {
-              Write-Host "  OK      $RelPath"
-            } else {
-              Write-Warning "  MISSING $installed\include\$RelPath"
-              $script:allOk = $false
+          $root = $env:VCPKG_INSTALLED
+          $pc = $env:PKG_CONFIG
+
+          if (!$pc -or !(Test-Path $pc)) {
+            $pc = "pkg-config"
+          }
+
+          $failed = @()
+
+          function Check-Header {
+            param([string] $Path)
+
+            if (Test-Path "$root\include\$Path") {
+              Write-Host "OK header: $Path"
+            }
+            else {
+              Write-Warning "MISSING header: $Path"
+              $script:failed += "header: $Path"
             }
           }
 
           function Check-Pkg {
-            param([string[]] $Candidates)
-            foreach ($name in $Candidates) {
-              $null = & $pc --exists $name 2>&1
-              if ($LASTEXITCODE -eq 0) {
-                $ver = (& $pc --modversion $name 2>&1) -join ''
-                Write-Host "  OK      $name  ($ver)"
-                return
-              }
+            param([string] $Name)
+
+            $null = & $pc --exists $Name 2>&1
+
+            if ($LASTEXITCODE -eq 0) {
+              $version = (& $pc --modversion $Name 2>&1) -join ""
+              Write-Host "OK pkg: $Name ($version)"
             }
-            Write-Warning "  MISSING $($Candidates -join ' | ')"
-            $script:allOk = $false
+            else {
+              Write-Warning "MISSING pkg-config package: $Name"
+              $script:failed += "pkg: $Name"
+            }
           }
 
-          Write-Host ""
-          Write-Host "=== Required headers ================================================="
+          Write-Host "=== Headers ==="
+
           Check-Header "boost/version.hpp"
+          Check-Header "boost/ptr_container/ptr_list.hpp"
           Check-Header "glib.h"
           Check-Header "sndfile.h"
           Check-Header "samplerate.h"
@@ -381,81 +441,68 @@ jobs:
           Check-Header "portaudio.h"
           Check-Header "rubberband/RubberBandStretcher.h"
           Check-Header "aubio/aubio.h"
-          Check-Header "taglib/tag.h"
           Check-Header "pthread.h"
 
-          # LV2 changed its header layout at v1.18; accept either path.
-          if ((Test-Path "$installed\include\lv2\lv2plug.in\ns\lv2core\lv2.h") -or
-              (Test-Path "$installed\include\lv2\lv2.h")) {
-            Write-Host "  OK      lv2 headers"
-          } else {
-            Write-Warning "  MISSING lv2 headers (checked both pre-1.18 and post-1.18 layouts)"
-            $script:allOk = $false
-          }
-
           Write-Host ""
-          Write-Host "=== pkg-config packages (single-name) ================================"
-          foreach ($pkg in @(
-              "glib-2.0", "sndfile", "samplerate", "fftw3", "flac",
-              "lilv-0", "rubberband", "liblo", "portaudio-2.0", "aubio", "taglib"
-          )) {
-            Check-Pkg $pkg
-          }
+          Write-Host "=== pkg-config ==="
 
-          Write-Host ""
-          Write-Host "=== GTKmm-family (either legacy or new API-version name accepted) ====="
-          Check-Pkg @('glibmm-2.68',  'glibmm-2.4')
-          Check-Pkg @('giomm-2.68',   'giomm-2.4')
-          Check-Pkg @('sigc++-3.0',   'sigc++-2.0')
-          Check-Pkg @('cairomm-1.16', 'cairomm-1.0')
-          Check-Pkg @('pangomm-2.48', 'pangomm-1.4')
+          Check-Pkg "glib-2.0"
+          Check-Pkg "sndfile"
+          Check-Pkg "samplerate"
+          Check-Pkg "fftw3"
+          Check-Pkg "flac"
+          Check-Pkg "lilv-0"
+          Check-Pkg "rubberband"
+          Check-Pkg "liblo"
+          Check-Pkg "portaudio-2.0"
+          Check-Pkg "aubio"
 
-          Write-Host ""
-          if (-not $script:allOk) {
-            Write-Error "One or more required dependencies are missing — see warnings above."
+          if ($failed.Count -gt 0) {
+            Write-Error "Dependency check failed:"
+            $failed | ForEach-Object {
+              Write-Error "  $_"
+            }
+
             exit 1
           }
-          Write-Host "All dependency checks passed."
-        shell: pwsh
+
+          Write-Host ""
+          Write-Host "All pre-configure dependency checks passed."
 
       # ================================================================
-      # 9. WAF CONFIGURE
+      # 12. WAF CONFIGURE
       # ================================================================
-      # --dist-target=msvc   activates Ardour's MSVC-specific code paths:
-      #   skips POSIX dlopen / dlfcn.h probes, enables the pthreadVC3
-      #   linkage mode, and activates the PortAudio audio backend.
-      #   Without this flag waf defaults to 'auto', which resolves to a
-      #   bare CPU-architecture string (e.g. 'x86_64'), not 'msvc'.
-      #
-      # --also-include / --also-libdir   expose vcpkg's trees directly to
-      #   Ardour's build system.  This supplements INCLUDE/LIB: some waf
-      #   check helpers and generated pkg-config command lines are
-      #   assembled without inheriting shell env vars, so passing the dirs
-      #   explicitly ensures every probe sees them.
-      #
-      # --optimize (Release) / --debug (Debug)   controlled by build_type
-      #   input.  The wscript maps these to compiler optimisation flags,
-      #   the NDEBUG macro, and debug-symbol emission.  Previously this
-      #   input was defined but never wired to any waf flag.
       - name: waf configure
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $installed = $env:VCPKG_INSTALLED
-          $wafArgs = @(
+
+          $args = @(
+            "waf",
             "configure",
             "--dist-target=msvc",
             "--prefix=$env:INSTALL_DIR",
             "--also-include=$installed\include",
             "--also-libdir=$installed\lib"
           )
-          if ("${{ inputs.build_type }}" -eq "Release") {
-            $wafArgs += "--optimize"
-          } else {
-            $wafArgs += "--debug"
-          }
-          Write-Host "waf $($wafArgs -join ' ')"
-          python waf @wafArgs
-        shell: pwsh
 
+          if ("${{ inputs.build_type }}" -eq "Release") {
+            $args += "--optimize"
+          }
+          else {
+            $args += "--debug"
+          }
+
+          Write-Host "Running:"
+          Write-Host "python $($args -join ' ')"
+
+          python @args
+
+      # ================================================================
+      # 13. CONFIGURE LOGS
+      # ================================================================
       - name: Upload configure logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -464,79 +511,125 @@ jobs:
           path: |
             ${{ github.workspace }}\build\config.log
             ${{ github.workspace }}\build\config.errors
+          if-no-files-found: warn
           retention-days: 14
 
       # ================================================================
-      # 10. BUILD
+      # 14. BUILD
       # ================================================================
       - name: waf build
-        run: |
-          $j = [Environment]::ProcessorCount
-          Write-Host "Parallel jobs: $j"
-          python waf build -j $j
         shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-      # Uploaded on build failure in addition to configure failure, so
-      # compiler errors are always retrievable without re-running.
+          $jobs = [Environment]::ProcessorCount
+
+          Write-Host "Building with $jobs parallel jobs."
+
+          python waf build -j $jobs
+
+      # ================================================================
+      # 15. BUILD LOGS
+      # ================================================================
       - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs-${{ github.run_number }}
           path: |
-            ${{ github.workspace }}\build\config.log
-            ${{ github.workspace }}\build\**\*.log
+            ${{ github.workspace }}\build
+          if-no-files-found: warn
           retention-days: 14
 
       # ================================================================
-      # 11. INSTALL
+      # 16. INSTALL
       # ================================================================
       - name: waf install
-        run: python waf install
         shell: pwsh
-
-      # ================================================================
-      # 12. BUNDLE RUNTIME DLLs
-      # ================================================================
-      # Windows requires every DLL to be in the same directory as the
-      # loading .exe.  Ardour's waf install places the executable under
-      # $prefix\bin\, not $prefix\ directly — in some builds one level
-      # deeper still (e.g. $prefix\bin\ardour8\ardour8.exe).
-      #
-      # -Depth 1 on the scan covers both flat  ($prefix\bin\ardour.exe)
-      # and one-deep ($prefix\bin\ardour8\ardour.exe) layouts without
-      # walking unbounded directory trees.  Every unique directory that
-      # contains a .exe gets the full set of vcpkg runtime DLLs.
-      - name: Bundle runtime DLLs
         run: |
-          $vcpkgBin = "$env:VCPKG_INSTALLED\bin"
-          $binRoot  = "$env:INSTALL_DIR\bin"
+          $ErrorActionPreference = "Stop"
+          python waf install
 
-          if (-not (Test-Path $binRoot)) {
-            Write-Warning "'$binRoot' not found — falling back to INSTALL_DIR root."
-            $binRoot = $env:INSTALL_DIR
+      # ================================================================
+      # 17. BUNDLE DLLS
+      # ================================================================
+      - name: Bundle runtime DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vcpkgBin = "$env:VCPKG_INSTALLED\bin"
+          $install = $env:INSTALL_DIR
+
+          if (!(Test-Path $vcpkgBin)) {
+            throw "vcpkg runtime directory not found: $vcpkgBin"
           }
 
-          $exeDirs = Get-ChildItem $binRoot -Recurse -Filter "*.exe" -Depth 1 |
+          $executables = Get-ChildItem `
+            -Path $install `
+            -Recurse `
+            -Filter "*.exe" `
+            -File
+
+          if ($executables.Count -eq 0) {
+            throw "No executable was installed under $install"
+          }
+
+          $dirs = $executables |
             Select-Object -ExpandProperty DirectoryName -Unique
 
-          if (-not $exeDirs) {
-            Write-Warning "No .exe files found under '$binRoot' — copying DLLs there anyway."
-            $exeDirs = @($binRoot)
+          $dlls = Get-ChildItem `
+            -Path $vcpkgBin `
+            -Filter "*.dll" `
+            -File
+
+          if ($dlls.Count -eq 0) {
+            throw "No vcpkg DLLs found in $vcpkgBin"
           }
 
-          foreach ($dir in $exeDirs) {
-            Write-Host "Copying vcpkg runtime DLLs -> $dir"
-            Copy-Item "$vcpkgBin\*.dll" -Destination $dir -Force
+          foreach ($dir in $dirs) {
+            Write-Host "Bundling $($dlls.Count) DLLs -> $dir"
+
+            Copy-Item `
+              -Path $dlls.FullName `
+              -Destination $dir `
+              -Force
           }
-        shell: pwsh
 
       # ================================================================
-      # 13. ARTIFACT
+      # 18. VALIDATE
+      # ================================================================
+      - name: Validate build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $executables = Get-ChildItem `
+            -Path $env:INSTALL_DIR `
+            -Recurse `
+            -Filter "*.exe" `
+            -File
+
+          if ($executables.Count -eq 0) {
+            throw "No Ardour executable was found."
+          }
+
+          Write-Host "Installed executables:"
+          $executables | ForEach-Object {
+            Write-Host "  $($_.FullName)"
+          }
+
+          Write-Host ""
+          Write-Host "Build validation passed."
+
+      # ================================================================
+      # 19. ARTIFACT
       # ================================================================
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ardour-windows-msvc-${{ github.run_number }}
+          name: ardour-windows-msvc-${{ inputs.build_type }}-${{ github.run_number }}
           path: ${{ env.INSTALL_DIR }}
+          if-no-files-found: error
           retention-days: 14
+```
