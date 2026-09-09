@@ -100,35 +100,70 @@ jobs:
             throw "$file was not found."
           }
 
-          $text = Get-Content $file -Raw
+          # Already patched (e.g. re-run on a reused workspace)? Nothing to do.
+          $existing = Get-Content $file -Raw
 
-          $marker = "      obj.source       = 'luasession.cc'"
+          if ($existing.Contains("../libs/pbd/msvc/getopt_long.c")) {
+            Write-Host "luasession getopt patch already exists. Skipping."
+            exit 0
+          }
 
-          $replacement = (
-            "      obj.source       = 'luasession.cc'`n" +
-            "`n" +
-            "      if bld.env['build_target'] == 'msvc':`n" +
-            "          obj.source += [`n" +
-            "              '../libs/pbd/msvc/getopt.c',`n" +
-            "              '../libs/pbd/msvc/getopt_long.c',`n" +
-            "          ]"
+          $lines = Get-Content $file
+
+          # Match the source line tolerant of whitespace/quote style, instead
+          # of relying on one exact literal string that upstream formatting
+          # changes can silently break.
+          #   obj.source       = 'luasession.cc'
+          #   obj.source = "luasession.cc"
+          $pattern = "^(?<indent>\s*)obj\.source\s*=\s*['""]luasession\.cc['""]\s*$"
+
+          $matchIndex = -1
+
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match $pattern) {
+              $matchIndex = $i
+              break
+            }
+          }
+
+          if ($matchIndex -eq -1) {
+            Write-Host ""
+            Write-Host "=========================================================="
+            Write-Host "Could not find the expected luasession source line."
+            Write-Host "Showing full file for diagnosis:"
+            Write-Host "=========================================================="
+            Get-Content $file | ForEach-Object { Write-Host $_ }
+
+            throw (
+              "Could not find expected luasession source marker " +
+              "(obj.source = 'luasession.cc'). " +
+              "Upstream luasession/wscript may have changed format; " +
+              "see file dump above and update the patch step."
+            )
+          }
+
+          $indent = $Matches['indent']
+          $innerIndent = $indent + "    "
+
+          $insertion = @(
+            "",
+            "${indent}if bld.env['build_target'] == 'msvc':",
+            "${innerIndent}obj.source += [",
+            "${innerIndent}    '../libs/pbd/msvc/getopt.c',",
+            "${innerIndent}    '../libs/pbd/msvc/getopt_long.c',",
+            "${innerIndent}]"
           )
 
-          if ($text.Contains($marker)) {
-            if (-not $text.Contains("../libs/pbd/msvc/getopt_long.c")) {
-              $text = $text.Replace($marker, $replacement)
-              Set-Content -Path $file -Value $text -Encoding UTF8
-
-              Write-Host "Added MSVC getopt sources to luasession."
-            }
-            else {
-              Write-Host "luasession getopt patch already exists."
-            }
-          }
-          else {
-            throw "Could not find expected luasession source marker."
+          $newLines = @()
+          $newLines += $lines[0..$matchIndex]
+          $newLines += $insertion
+          if ($matchIndex + 1 -lt $lines.Count) {
+            $newLines += $lines[($matchIndex + 1)..($lines.Count - 1)]
           }
 
+          Set-Content -Path $file -Value $newLines -Encoding UTF8
+
+          Write-Host "Added MSVC getopt sources to luasession."
           Write-Host ""
           Write-Host "Resulting section:"
           Get-Content $file |
