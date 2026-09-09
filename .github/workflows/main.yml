@@ -68,6 +68,17 @@ jobs:
       # ships a vcpkg.json manifest, replace this block with
       # `vcpkg install --triplet ${{ env.VCPKG_TRIPLET }}` in manifest mode
       # instead of listing packages by hand.
+      #
+      # NOTE: "boost" here is the vcpkg umbrella package (pulls in the
+      # full boost distribution: headers/config, system, filesystem,
+      # thread, etc.), not individual boost-* components. waf's boost
+      # check does a blunt version probe against boost/version.hpp,
+      # which only exists if boost-config/boost-headers is installed —
+      # picking individual components like boost-format without the
+      # umbrella causes "Checking for boost library >= 1.68 : no" even
+      # though some boost packages are present. If you want a smaller
+      # footprint, swap "boost" for the exact set of boost-* components
+      # Ardour actually needs, but always include boost-config.
       # ---------------------------------------------------------------
 
       # Single source of truth for the package list. The installed-package
@@ -77,9 +88,7 @@ jobs:
       - name: Write vcpkg package manifest
         run: |
           @'
-          boost-format
-          boost-optional
-          boost-smart-ptr
+          boost
           glib
           glibmm
           gtkmm
@@ -196,6 +205,16 @@ jobs:
       - name: waf configure
         run: python waf configure --dist-target=msvc --prefix="$env:INSTALL_DIR" --optimize
         shell: pwsh
+
+      # Surfaces the exact boost/library detection failure (and any other
+      # configure-time probe failure) without needing to re-run and guess.
+      - name: Upload config.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-log-${{ github.run_number }}
+          path: ${{ github.workspace }}\build\config.log
+          retention-days: 14
 
       # -j scales to whatever the runner actually has instead of a
       # hardcoded guess, so this stays correct if you ever move to a
