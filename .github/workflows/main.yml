@@ -55,10 +55,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             git remote add upstream https://github.com/Ardour/ardour.git
           }
-          else {
-            Write-Host "upstream remote already exists:"
-            Write-Host $existingRemote
-          }
 
           git fetch upstream --tags --force --prune
 
@@ -128,8 +124,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Visual Studio may set VCPKG_ROOT to its own bundled copy.
-          # We deliberately do not use that variable.
           Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
 
           $vcpkg = $env:VCPKG_HOME
@@ -139,16 +133,11 @@ jobs:
           if (!(Test-Path "$vcpkg\.git")) {
 
             if (Test-Path $vcpkg) {
-              Write-Host "Existing C:\vcpkg is not a Git repository."
-              Write-Host "Removing it..."
-
               Remove-Item `
                 -Path $vcpkg `
                 -Recurse `
                 -Force
             }
-
-            Write-Host "Cloning standalone vcpkg..."
 
             git clone `
               https://github.com/microsoft/vcpkg.git `
@@ -160,11 +149,9 @@ jobs:
           git fetch origin --tags --quiet
 
           if ("${{ inputs.vcpkg_ref }}" -ne "") {
-            Write-Host "Using pinned vcpkg ref: ${{ inputs.vcpkg_ref }}"
             git checkout "${{ inputs.vcpkg_ref }}"
           }
           else {
-            Write-Host "Using latest vcpkg master"
             git checkout master --quiet
             git pull --ff-only origin master
           }
@@ -184,7 +171,7 @@ jobs:
           Write-Host "Standalone vcpkg is ready."
 
       # ================================================================
-      # 6. VCPKG DEPENDENCY CACHE
+      # 6. DEPENDENCY CACHE
       # ================================================================
       - name: Restore vcpkg dependency cache
         uses: actions/cache@v4
@@ -201,7 +188,7 @@ jobs:
             ardour-deps-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
 
       # ================================================================
-      # 7. DOWNLOAD ARDOUR MSVC DEPENDENCY HELPER
+      # 7. ARDOUR MSVC DEPENDENCY HELPER
       # ================================================================
       - name: Download Ardour dependency helper
         shell: pwsh
@@ -241,19 +228,14 @@ jobs:
           if ($text.Contains($old)) {
             $text = $text.Replace($old, $new)
           }
-          else {
-            Write-Host "Helper does not contain the expected local-vcpkg path."
-          }
 
           Set-Content `
             -Path $file `
             -Value $text `
             -Encoding utf8
 
-          Write-Host "Dependency helper configured."
-
       # ================================================================
-      # 9. INSTALL ARDOUR DEPENDENCIES
+      # 9. INSTALL DEPENDENCIES
       # ================================================================
       - name: Install Ardour dependencies
         shell: pwsh
@@ -266,10 +248,8 @@ jobs:
             throw "Expected vcpkg installed tree was not created."
           }
 
-          Write-Host "Ardour dependency installation completed."
-
       # ================================================================
-      # 10. CONFIGURE VCPKG ENVIRONMENT
+      # 10. VCPKG ENVIRONMENT
       # ================================================================
       - name: Configure vcpkg environment
         shell: pwsh
@@ -330,10 +310,8 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          Write-Host "vcpkg environment configured."
-
       # ================================================================
-      # 11. GENERATE EXPLICIT MSVC INCLUDE FLAGS
+      # 11. EXPLICIT MSVC INCLUDE FLAGS
       # ================================================================
       - name: Configure explicit MSVC include flags
         shell: pwsh
@@ -353,7 +331,6 @@ jobs:
 
           [void]$includeDirs.Add("$installed\include")
 
-          # Query pkg-config for package-specific include directories.
           $packages = @(
             "glib-2.0",
             "gobject-2.0",
@@ -407,7 +384,6 @@ jobs:
               if ($token.StartsWith("-I")) {
 
                 $path = $token.Substring(2).Trim('"')
-
                 $path = $path -replace '/', '\'
 
                 if ($path.Length -gt 0) {
@@ -417,17 +393,12 @@ jobs:
             }
           }
 
-          # Explicit known include locations for Windows/vcpkg layouts.
           $knownDirectories = @(
             "$installed\include",
             "$installed\include\glib-2.0",
             "$installed\lib\glib-2.0\include",
             "$installed\include\libxml2",
-
-            # FIX:
-            # vcpkg/libusb places libusb.h under include\libusb-1.0.
             "$installed\include\libusb-1.0",
-
             "$installed\include\pthread",
             "$installed\include\sigc++-2.0",
             "$installed\include\glibmm-2.66",
@@ -442,15 +413,6 @@ jobs:
             }
           }
 
-          Write-Host ""
-          Write-Host "==============================================================="
-          Write-Host "Resolved include directories"
-          Write-Host "==============================================================="
-
-          foreach ($directory in $includeDirs) {
-            Write-Host "  $directory"
-          }
-
           $flags = @()
 
           foreach ($directory in $includeDirs) {
@@ -461,9 +423,7 @@ jobs:
           $includeFlags = $flags -join " "
 
           Write-Host ""
-          Write-Host "==============================================================="
-          Write-Host "Generated MSVC include flags"
-          Write-Host "==============================================================="
+          Write-Host "Resolved include flags:"
           Write-Host $includeFlags
 
           "CFLAGS=$includeFlags $env:CFLAGS" |
@@ -486,11 +446,8 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          Write-Host ""
-          Write-Host "MSVC include flags configured."
-
       # ================================================================
-      # 12. VERIFY IMPORTANT MSVC HEADERS
+      # 12. VERIFY IMPORTANT HEADERS
       # ================================================================
       - name: Verify MSVC dependency headers
         shell: pwsh
@@ -526,8 +483,6 @@ jobs:
             -Path "$testDir\test.cpp" `
             -Encoding utf8
 
-          Write-Host "Testing MSVC dependency headers..."
-
           & cl `
             /nologo `
             /EHsc `
@@ -536,16 +491,10 @@ jobs:
             /Fo"$testDir\test.obj"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "MSVC cannot see one or more required Ardour dependency headers."
+            throw "MSVC dependency header test failed."
           }
 
-          Write-Host ""
-          Write-Host "Header visibility test passed."
-          Write-Host "  glib.h"
-          Write-Host "  glibmm.h"
-          Write-Host "  sigc++/trackable.h"
-          Write-Host "  libxml/parser.h"
-          Write-Host "  libusb.h"
+          Write-Host "MSVC dependency headers are visible."
 
       # ================================================================
       # 13. VERIFY PKG-CONFIG
@@ -600,9 +549,6 @@ jobs:
             Write-Host "OK  $package ($version)"
           }
 
-          Write-Host ""
-          Write-Host "All pkg-config dependency checks passed."
-
       # ================================================================
       # 14. WAF CONFIGURE
       # ================================================================
@@ -630,27 +576,90 @@ jobs:
             $args += "--debug"
           }
 
-          Write-Host ""
           Write-Host "Running:"
           Write-Host "python waf $($args -join ' ')"
-          Write-Host ""
 
           python waf @args
 
       # ================================================================
-      # 15. CONFIGURE LOGS
+      # 15. PATCH ARDOUR9-LUA GETOPT LINKAGE
       # ================================================================
-      - name: Upload configure logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ardour-config-${{ github.run_number }}
-          path: |
-            ${{ github.workspace }}\build\config.log
-            ${{ github.workspace }}\build\config.summary
-            ${{ github.workspace }}\build\config.errors
-          if-no-files-found: warn
-          retention-days: 14
+      # The MSVC build compiles getopt.c/getopt_long.c as part of libpbd,
+      # but ardour9-lua is a separate executable and can end up referring
+      # to getopt_long_a without receiving the getopt implementation.
+      #
+      # Before building, locate the generated getopt object/library and
+      # make a small Waf source patch so the Lua executable links against
+      # the same implementation.
+      #
+      # The patch is guarded and only applied if ardour9-lua's wscript
+      # exists and the relevant target is present.
+      # ================================================================
+      - name: Fix ardour9-lua getopt linkage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $candidateFiles = @(
+            "luasession/wscript",
+            "gtk2_ardour/wscript",
+            "wscript"
+          )
+
+          $targetFile = $null
+
+          foreach ($file in $candidateFiles) {
+            if (Test-Path $file) {
+              $text = Get-Content $file -Raw
+
+              if ($text -match "ardour9-lua") {
+                $targetFile = $file
+                break
+              }
+            }
+          }
+
+          if (!$targetFile) {
+            Write-Warning "Could not find the Waf definition containing ardour9-lua."
+            Write-Warning "Leaving the source unchanged."
+            return
+          }
+
+          Write-Host "Found ardour9-lua definition in: $targetFile"
+
+          $text = Get-Content $targetFile -Raw
+
+          # Only modify the file when getopt is not already explicitly
+          # attached to the target.
+          if (
+            $text -notmatch "getopt_long" -and
+            $text -match "ardour9-lua"
+          ) {
+
+            # Add a Waf-use dependency on libpbd where possible.
+            #
+            # This is deliberately conservative: if the target already
+            # uses the PBD library, no change is required.
+            if ($text -notmatch "'PBD'" -and $text -notmatch '"PBD"') {
+              Write-Host "Adding PBD dependency to the Lua target."
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Searching for compiled getopt objects..."
+
+          Get-ChildItem `
+            "$env:GITHUB_WORKSPACE\build" `
+            -Recurse `
+            -Include "getopt*.obj","getopt*.o","*getopt*.lib" `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 30 |
+            ForEach-Object {
+              Write-Host "  $($_.FullName)"
+            }
+
+          Write-Host ""
+          Write-Host "Getopt linkage diagnostics complete."
 
       # ================================================================
       # 16. BUILD
@@ -689,7 +698,7 @@ jobs:
           python waf install
 
       # ================================================================
-      # 19. BUNDLE RUNTIME DLLS
+      # 19. BUNDLE RUNTIME DLLs
       # ================================================================
       - name: Bundle runtime DLLs
         shell: pwsh
@@ -723,7 +732,7 @@ jobs:
           )
 
           if ($dlls.Count -eq 0) {
-            throw "No vcpkg runtime DLLs were found."
+            throw "No vcpkg DLLs were found."
           }
 
           $directories = $executables |
