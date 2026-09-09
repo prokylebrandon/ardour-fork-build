@@ -505,15 +505,15 @@ jobs:
 
           $marker = "      obj.source       = 'luasession.cc'"
 
-          $replacement = @"
-      obj.source       = 'luasession.cc'
-
-      if bld.env['build_target'] == 'msvc':
-          obj.source += [
-              '../libs/pbd/msvc/getopt.c',
-              '../libs/pbd/msvc/getopt_long.c',
-          ]
-"@
+          $replacement = (
+            "      obj.source       = 'luasession.cc'`n" +
+            "`n" +
+            "      if bld.env['build_target'] == 'msvc':`n" +
+            "          obj.source += [`n" +
+            "              '../libs/pbd/msvc/getopt.c',`n" +
+            "              '../libs/pbd/msvc/getopt_long.c',`n" +
+            "          ]"
+          )
 
           if ($text.Contains($marker)) {
             if (-not $text.Contains("../libs/pbd/msvc/getopt_long.c")) {
