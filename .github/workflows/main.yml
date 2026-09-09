@@ -1,4 +1,3 @@
-```yaml
 name: Build Ardour (Windows / MSVC)
 
 on:
@@ -632,4 +631,3 @@ jobs:
           path: ${{ env.INSTALL_DIR }}
           if-no-files-found: error
           retention-days: 14
-```
