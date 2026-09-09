@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       build_type:
-        description: "Build configuration"
+        description: "waf build type"
         required: true
         default: "Release"
         type: choice
@@ -13,14 +13,13 @@ on:
           - Debug
 
       vcpkg_ref:
-        description: "Optional vcpkg commit/tag. Leave blank for latest."
+        description: "vcpkg commit/tag to pin (blank = latest master)"
         required: false
         default: ""
         type: string
 
 env:
   VCPKG_HOME: C:\vcpkg
-  VCPKG_ROOT: C:\vcpkg
   VCPKG_TRIPLET: x64-windows
   INSTALL_DIR: ${{ github.workspace }}\dist
 
@@ -29,10 +28,11 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      # ------------------------------------------------------------
-      # Checkout Ardour
-      # ------------------------------------------------------------
-      - name: Checkout source
+
+      # ================================================================
+      # 1. SOURCE
+      # ================================================================
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -40,447 +40,46 @@ jobs:
           filter: blob:none
           submodules: recursive
 
-      # ------------------------------------------------------------
-      # Python
-      # ------------------------------------------------------------
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # ------------------------------------------------------------
-      # MSVC
-      # ------------------------------------------------------------
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      # ------------------------------------------------------------
-      # LLVM
-      # ------------------------------------------------------------
-      - name: Install LLVM
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "18"
-          directory: ${{ runner.temp }}/llvm
-
-      # ------------------------------------------------------------
-      # Perl
-      # ------------------------------------------------------------
-      - name: Add Strawberry Perl to PATH
-        shell: powershell
-        run: |
-          $perlPaths = @(
-            "C:\Strawberry\perl\bin",
-            "C:\Strawberry\c\bin"
-          )
-
-          foreach ($path in $perlPaths) {
-            if (Test-Path $path) {
-              Add-Content $env:GITHUB_PATH $path
-            }
-          }
-
-          perl --version
-
-      # ------------------------------------------------------------
-      # vcpkg cache
-      # ------------------------------------------------------------
-      - name: Cache vcpkg
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\vcpkg
-            C:\Users\runneradmin\AppData\Local\vcpkg
-          key: >-
-            windows-2022-vcpkg-${{ runner.arch }}-${{ hashFiles('**/vcpkg.json') }}-${{
-              github.event.inputs.vcpkg_ref
-            }}
-          restore-keys: |
-            windows-2022-vcpkg-${{ runner.arch }}-
-
-      # ------------------------------------------------------------
-      # Install / bootstrap vcpkg
-      # ------------------------------------------------------------
-      - name: Prepare vcpkg
-        shell: powershell
+      # ================================================================
+      # 2. FETCH ARDOUR UPSTREAM TAGS
+      # ================================================================
+      - name: Fetch Ardour upstream tags
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $vcpkgRoot = "C:\vcpkg"
-          $vcpkgExe = "$vcpkgRoot\vcpkg.exe"
+          Write-Host "Fetching official Ardour tags..."
 
-          New-Item -ItemType Directory -Force -Path $vcpkgRoot | Out-Null
+          $existingRemote = git remote get-url upstream 2>$null
 
-          if (-not (Test-Path $vcpkgExe)) {
-            Write-Host "vcpkg.exe not found. Cloning vcpkg..."
-
-            if (Test-Path "$vcpkgRoot\.git") {
-              Push-Location $vcpkgRoot
-              git fetch --all --tags --force
-              Pop-Location
-            }
-            else {
-              Remove-Item -Recurse -Force $vcpkgRoot -ErrorAction SilentlyContinue
-
-              git clone `
-                --depth=1 `
-                https://github.com/microsoft/vcpkg.git `
-                $vcpkgRoot
-            }
-
-            Push-Location $vcpkgRoot
-
-            if (Test-Path ".\bootstrap-vcpkg.bat") {
-              & .\bootstrap-vcpkg.bat -disableMetrics
-            }
-            else {
-              throw "bootstrap-vcpkg.bat was not found."
-            }
-
-            Pop-Location
-          }
-
-          if ("${{ github.event.inputs.vcpkg_ref }}" -ne "") {
-            Write-Host "Pinning vcpkg to ${{ github.event.inputs.vcpkg_ref }}"
-
-            Push-Location $vcpkgRoot
-
-            git fetch --all --tags --force
-            git checkout --force "${{ github.event.inputs.vcpkg_ref }}"
-
-            & .\bootstrap-vcpkg.bat -disableMetrics
-
-            Pop-Location
-          }
-
-          & $vcpkgExe version
-
-          # Make absolutely sure these are available to every step.
-          Add-Content $env:GITHUB_ENV "VCPKG_ROOT=C:\vcpkg"
-          Add-Content $env:GITHUB_ENV "VCPKG_DEFAULT_TRIPLET=x64-windows"
-
-          Add-Content $env:GITHUB_PATH "C:\vcpkg"
-
-      # ------------------------------------------------------------
-      # Download Ardour's dependency helper
-      # ------------------------------------------------------------
-      - name: Download Ardour dependency helper
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $helperDir = "$env:RUNNER_TEMP\ardour-deps"
-          $helper = "$helperDir\InstallDependencies.vcpkg.py"
-
-          New-Item -ItemType Directory -Force -Path $helperDir | Out-Null
-
-          Invoke-WebRequest `
-            -Uri "https://raw.githubusercontent.com/EZ4Stephen/testardourdeps/main/vcpkg-build/InstallDependencies.vcpkg.py" `
-            -OutFile $helper
-
-          Write-Host "Downloaded:"
-          Get-Item $helper | Format-List FullName,Length
-
-      # ------------------------------------------------------------
-      # Patch dependency helper so it uses C:\vcpkg
-      #
-      # Original helper assumes its own local ./vcpkg directory.
-      # We force it to use the actual cached C:\vcpkg installation.
-      # ------------------------------------------------------------
-      - name: Patch dependency helper
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $helper = "$env:RUNNER_TEMP\ardour-deps\InstallDependencies.vcpkg.py"
-
-          $text = Get-Content $helper -Raw
-
-          $old = '_vcpkg_dir = _script_dir / "vcpkg"'
-
-          $new = '_vcpkg_dir = Path(os.environ.get("VCPKG_ROOT", r"C:\vcpkg"))'
-
-          if ($text.Contains($old)) {
-            $text = $text.Replace($old, $new)
-            Write-Host "Patched helper vcpkg directory."
+          if ($LASTEXITCODE -ne 0) {
+            git remote add upstream https://github.com/Ardour/ardour.git
           }
           else {
-            Write-Host "Expected vcpkg path line was not found."
-            Write-Host "Continuing without that replacement."
+            Write-Host "upstream remote already exists:"
+            Write-Host $existingRemote
           }
 
-          Set-Content `
-            -Path $helper `
-            -Value $text `
-            -Encoding UTF8
-
-          Get-Content $helper | Select-String "_vcpkg_dir"
-
-      # ------------------------------------------------------------
-      # Install dependencies
-      # ------------------------------------------------------------
-      - name: Install Ardour dependencies
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $helper = "$env:RUNNER_TEMP\ardour-deps\InstallDependencies.vcpkg.py"
-
-          $env:VCPKG_ROOT = "C:\vcpkg"
-          $env:VCPKG_DEFAULT_TRIPLET = "x64-windows"
-
-          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
-          Write-Host "VCPKG_DEFAULT_TRIPLET=$env:VCPKG_DEFAULT_TRIPLET"
-
-          python $helper
-
-      # ------------------------------------------------------------
-      # Locate pkg-config / pkgconf
-      # ------------------------------------------------------------
-      - name: Prepare pkg-config
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $vcpkgRoot = "C:\vcpkg"
-          $installed = "$vcpkgRoot\installed\x64-windows"
-
-          $pkgconfCandidates = @(
-            "$vcpkgRoot\downloads\tools\pkgconf\*\pkgconf.exe",
-            "$vcpkgRoot\installed\x64-windows\tools\pkgconf\pkgconf.exe",
-            "$vcpkgRoot\installed\x64-windows\tools\pkgconf\pkg-config.exe"
-          )
-
-          $pkgconf = $null
-
-          foreach ($pattern in $pkgconfCandidates) {
-            $found = Get-ChildItem `
-              -Path $pattern `
-              -File `
-              -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-
-            if ($found) {
-              $pkgconf = $found.FullName
-              break
-            }
-          }
-
-          if (-not $pkgconf) {
-            $found = Get-ChildItem `
-              -Path $vcpkgRoot `
-              -Recurse `
-              -Filter "pkgconf.exe" `
-              -File `
-              -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-
-            if ($found) {
-              $pkgconf = $found.FullName
-            }
-          }
-
-          if (-not $pkgconf) {
-            throw "Could not find pkgconf.exe."
-          }
-
-          Write-Host "Found pkgconf: $pkgconf"
-
-          $pkgconfDir = Split-Path $pkgconf -Parent
-
-          if (-not (Test-Path "$pkgconfDir\pkg-config.exe")) {
-            Copy-Item `
-              $pkgconf `
-              "$pkgconfDir\pkg-config.exe"
-          }
-
-          Add-Content $env:GITHUB_PATH $pkgconfDir
-
-          $pkgConfigDirs = @()
-
-          $libDir = "$installed\lib"
-          $shareDir = "$installed\share"
-
-          if (Test-Path $libDir) {
-            $pcFiles = Get-ChildItem `
-              -Path $libDir `
-              -Recurse `
-              -Filter "*.pc" `
-              -File `
-              -ErrorAction SilentlyContinue
-
-            foreach ($pc in $pcFiles) {
-              $dir = $pc.Directory.FullName
-
-              if ($pkgConfigDirs -notcontains $dir) {
-                $pkgConfigDirs += $dir
-              }
-            }
-          }
-
-          if (Test-Path $shareDir) {
-            $pcFiles = Get-ChildItem `
-              -Path $shareDir `
-              -Recurse `
-              -Filter "*.pc" `
-              -File `
-              -ErrorAction SilentlyContinue
-
-            foreach ($pc in $pcFiles) {
-              $dir = $pc.Directory.FullName
-
-              if ($pkgConfigDirs -notcontains $dir) {
-                $pkgConfigDirs += $dir
-              }
-            }
-          }
-
-          if ($pkgConfigDirs.Count -gt 0) {
-            $pkgPath = $pkgConfigDirs -join ";"
-
-            Add-Content `
-              $env:GITHUB_ENV `
-              "PKG_CONFIG_PATH=$pkgPath"
-
-            Write-Host "PKG_CONFIG_PATH=$pkgPath"
-          }
-
-          pkg-config --version
-
-      # ------------------------------------------------------------
-      # Prepare MSVC include / lib paths
-      #
-      # IMPORTANT:
-      # We do NOT set LD_LIBRARY_PATH or DYLD_LIBRARY_PATH here.
-      # Those are Unix/macOS variables and were causing a suspicious
-      # Windows environment such as DYLD_LIBRARY_PATH=...;undefined.
-      # ------------------------------------------------------------
-      - name: Prepare compiler environment
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $vcpkgRoot = "C:\vcpkg"
-          $triplet = "x64-windows"
-
-          $include = "$vcpkgRoot\installed\$triplet\include"
-          $lib = "$vcpkgRoot\installed\$triplet\lib"
-          $bin = "$vcpkgRoot\installed\$triplet\bin"
-
-          if (-not (Test-Path $include)) {
-            throw "vcpkg include directory does not exist: $include"
-          }
-
-          if (-not (Test-Path $lib)) {
-            throw "vcpkg lib directory does not exist: $lib"
-          }
-
-          $currentInclude = $env:INCLUDE
-          $newInclude = "$include;$currentInclude"
-
-          Add-Content `
-            $env:GITHUB_ENV `
-            "INCLUDE=$newInclude"
-
-          $currentLib = $env:LIB
-          $newLib = "$lib;$currentLib"
-
-          Add-Content `
-            $env:GITHUB_ENV `
-            "LIB=$newLib"
-
-          $currentPath = $env:PATH
-          $newPath = "$bin;$currentPath"
-
-          Add-Content `
-            $env:GITHUB_ENV `
-            "PATH=$newPath"
-
-          # These help Waf / pkg-config based detection.
-          Add-Content `
-            $env:GITHUB_ENV `
-            "CFLAGS=/I`"$include`""
-
-          Add-Content `
-            $env:GITHUB_ENV `
-            "CXXFLAGS=/I`"$include`""
-
-          Write-Host "INCLUDE configured."
-          Write-Host "LIB configured."
-          Write-Host "PATH configured."
+          git fetch upstream --tags --force --prune
 
           Write-Host ""
-          Write-Host "Checking important directories:"
-          Write-Host "  include = $include"
-          Write-Host "  lib     = $lib"
-          Write-Host "  bin     = $bin"
-
-      # ------------------------------------------------------------
-      # Verify important headers
-      # ------------------------------------------------------------
-      - name: Verify vcpkg headers
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $include = "C:\vcpkg\installed\x64-windows\include"
-
-          $headers = @(
-            "glib.h",
-            "glibmm.h",
-            "sigc++\sigc++.h",
-            "libxml2\libxml\parser.h",
-            "libusb-1.0\libusb.h",
-            "curl\curl.h",
-            "sndfile.h",
-            "taglib\tag.h",
-            "fftw3.h"
-          )
-
-          foreach ($header in $headers) {
-            $path = Join-Path $include $header
-
-            if (Test-Path $path) {
-              Write-Host "[OK] $header"
-            }
-            else {
-              Write-Host "[MISSING] $header"
-            }
-          }
-
-      # ------------------------------------------------------------
-      # Fetch Ardour tags
-      #
-      # git describe HEAD previously failed because the checkout did
-      # not contain enough tag information.
-      # ------------------------------------------------------------
-      - name: Fetch Ardour tags
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $remotes = git remote
-
-          if ($remotes -contains "upstream") {
-            git remote remove upstream
-          }
-
-          git remote add upstream https://github.com/Ardour/ardour.git
-
-          git fetch `
-            upstream `
-            --tags `
-            --force `
-            --prune
+          Write-Host "Current HEAD:"
+          git log -1 --oneline --decorate
 
           Write-Host ""
-          Write-Host "Git description:"
-          git describe --tags --always --dirty
+          Write-Host "Testing git describe HEAD..."
 
-      # ------------------------------------------------------------
-      # Patch luasession getopt linking
+          $describe = git describe HEAD 2>&1
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error ($describe -join "`n")
+            throw "git describe HEAD failed after fetching Ardour tags."
+          }
+
+          Write-Host "git describe HEAD = $($describe -join '')"
+
+      # ================================================================
+      # 3. PATCH LUASESSION MSVC GETOPT LINKING
       #
       # Ardour's libpbd contains getopt.c/getopt_long.c for MSVC,
       # but ardour9-lua can still end up with:
@@ -489,9 +88,9 @@ jobs:
       #
       # We compile the MSVC getopt sources directly into the
       # luasession target so the symbols are available there.
-      # ------------------------------------------------------------
+      # ================================================================
       - name: Patch luasession MSVC getopt
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -535,14 +134,540 @@ jobs:
           Get-Content $file |
             Select-String -Pattern "getopt|obj.source" -Context 2,2
 
-      # ------------------------------------------------------------
-      # Clean previous Waf build state
+      # ================================================================
+      # 4. TOOLCHAIN
+      # ================================================================
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18"
+
+      - name: Ensure Strawberry Perl is on PATH
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\Strawberry\perl\bin") {
+            "C:\Strawberry\perl\bin" |
+              Out-File `
+                -FilePath $env:GITHUB_PATH `
+                -Encoding utf8 `
+                -Append
+          }
+
+      # ================================================================
+      # 5. VCPKG TOOL CACHE
+      # ================================================================
+      - name: Restore vcpkg tool cache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg
+          key: >-
+            ardour-vcpkg-tool-${{ runner.os }}-
+            ${{ inputs.vcpkg_ref != '' && inputs.vcpkg_ref || 'latest' }}
+          restore-keys: |
+            ardour-vcpkg-tool-${{ runner.os }}-
+
+      # ================================================================
+      # 6. STANDALONE VCPKG
+      # ================================================================
+      - name: Bootstrap standalone vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Visual Studio may set VCPKG_ROOT to its own bundled copy.
+          # We deliberately do not use that variable.
+          Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
+
+          $vcpkg = $env:VCPKG_HOME
+
+          Write-Host "Using standalone vcpkg: $vcpkg"
+
+          if (!(Test-Path "$vcpkg\.git")) {
+
+            if (Test-Path $vcpkg) {
+              Write-Host "Existing C:\vcpkg is not a Git repository."
+              Write-Host "Removing it..."
+
+              Remove-Item `
+                -Path $vcpkg `
+                -Recurse `
+                -Force
+            }
+
+            Write-Host "Cloning standalone vcpkg..."
+
+            git clone `
+              https://github.com/microsoft/vcpkg.git `
+              $vcpkg
+          }
+
+          Push-Location $vcpkg
+
+          git fetch origin --tags --quiet
+
+          if ("${{ inputs.vcpkg_ref }}" -ne "") {
+            Write-Host "Using pinned vcpkg ref: ${{ inputs.vcpkg_ref }}"
+            git checkout "${{ inputs.vcpkg_ref }}"
+          }
+          else {
+            Write-Host "Using latest vcpkg master"
+            git checkout master --quiet
+            git pull --ff-only origin master
+          }
+
+          Pop-Location
+
+          if (!(Test-Path "$vcpkg\bootstrap-vcpkg.bat")) {
+            throw "bootstrap-vcpkg.bat not found at $vcpkg"
+          }
+
+          & "$vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+          if (!(Test-Path "$vcpkg\vcpkg.exe")) {
+            throw "vcpkg.exe was not created."
+          }
+
+          Write-Host "Standalone vcpkg is ready."
+
+      # ================================================================
+      # 7. VCPKG DEPENDENCY CACHE
+      # ================================================================
+      - name: Restore vcpkg dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\packages
+            C:\vcpkg\downloads
+            C:\vcpkg\buildtrees
+          key: >-
+            ardour-deps-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
+            ${{ inputs.vcpkg_ref != '' && inputs.vcpkg_ref || 'floating' }}
+          restore-keys: |
+            ardour-deps-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
+
+      # ================================================================
+      # 8. DOWNLOAD ARDOUR MSVC DEPENDENCY HELPER
+      # ================================================================
+      - name: Download Ardour dependency helper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://raw.githubusercontent.com/EZ4Stephen/testardourdeps/main/vcpkg-build/InstallDependencies.vcpkg.py"
+          $file = "$env:GITHUB_WORKSPACE\InstallDependencies.vcpkg.py"
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $file
+
+          if (!(Test-Path $file)) {
+            throw "Failed to download Ardour dependency helper."
+          }
+
+          Write-Host "Downloaded Ardour dependency helper."
+
+      # ================================================================
+      # 9. POINT HELPER AT OUR STANDALONE VCPKG
+      # ================================================================
+      - name: Configure dependency helper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $file = "$env:GITHUB_WORKSPACE\InstallDependencies.vcpkg.py"
+
+          $text = Get-Content `
+            -Path $file `
+            -Raw
+
+          $old = '_vcpkg_dir = _script_dir / "vcpkg"'
+          $new = '_vcpkg_dir = Path(r"C:\vcpkg")'
+
+          if ($text.Contains($old)) {
+            $text = $text.Replace($old, $new)
+          }
+          else {
+            Write-Host "Helper does not contain the expected local-vcpkg path."
+          }
+
+          Set-Content `
+            -Path $file `
+            -Value $text `
+            -Encoding utf8
+
+          Write-Host "Dependency helper configured."
+
+      # ================================================================
+      # 10. INSTALL ARDOUR DEPENDENCIES
+      # ================================================================
+      - name: Install Ardour dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python "$env:GITHUB_WORKSPACE\InstallDependencies.vcpkg.py"
+
+          if (!(Test-Path "$env:VCPKG_HOME\installed\$env:VCPKG_TRIPLET")) {
+            throw "Expected vcpkg installed tree was not created."
+          }
+
+          Write-Host "Ardour dependency installation completed."
+
+      # ================================================================
+      # 11. CONFIGURE VCPKG ENVIRONMENT
+      # ================================================================
+      - name: Configure vcpkg environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installed = "$env:VCPKG_HOME\installed\$env:VCPKG_TRIPLET"
+          $pkgconfDir = "$installed\tools\pkgconf"
+          $pkgconfExe = "$pkgconfDir\pkgconf.exe"
+
+          if (!(Test-Path $installed)) {
+            throw "Installed vcpkg tree not found: $installed"
+          }
+
+          if (!(Test-Path $pkgconfExe)) {
+            throw "pkgconf.exe not found: $pkgconfExe"
+          }
+
+          "VCPKG_INSTALLED=$installed" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "INCLUDE=$installed\include;$env:INCLUDE" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "LIB=$installed\lib;$env:LIB" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "PKG_CONFIG_PATH=$installed\lib\pkgconfig;$installed\share\pkgconfig" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "PKG_CONFIG=$pkgconfExe" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "$pkgconfDir" |
+            Out-File `
+              -FilePath $env:GITHUB_PATH `
+              -Encoding utf8 `
+              -Append
+
+          "$installed\bin" |
+            Out-File `
+              -FilePath $env:GITHUB_PATH `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host "vcpkg environment configured."
+
+      # ================================================================
+      # 12. GENERATE EXPLICIT MSVC INCLUDE FLAGS
+      # ================================================================
+      - name: Configure explicit MSVC include flags
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installed = $env:VCPKG_INSTALLED
+          $pkgconf = $env:PKG_CONFIG
+
+          if (!(Test-Path $pkgconf)) {
+            throw "PKG_CONFIG executable not found: $pkgconf"
+          }
+
+          $includeDirs = New-Object `
+            System.Collections.Generic.HashSet[string] `
+            ([System.StringComparer]::OrdinalIgnoreCase)
+
+          [void]$includeDirs.Add("$installed\include")
+
+          # Query pkg-config for package-specific include directories.
+          $packages = @(
+            "glib-2.0",
+            "gobject-2.0",
+            "gio-2.0",
+            "gmodule-2.0",
+            "gthread-2.0",
+            "glibmm-2.4",
+            "giomm-2.4",
+            "sigc++-2.0",
+            "cairo",
+            "cairomm-1.0",
+            "pango",
+            "pangomm-1.4",
+            "pangocairo",
+            "pangoft2",
+            "libxml-2.0",
+            "libpng",
+            "sndfile",
+            "samplerate",
+            "fftw3",
+            "fftw3f",
+            "flac",
+            "ogg",
+            "lilv-0",
+            "serd-0",
+            "sord-0",
+            "sratom-0",
+            "rubberband",
+            "liblo",
+            "portaudio-2.0",
+            "aubio",
+            "lv2",
+            "libusb-1.0"
+          )
+
+          foreach ($package in $packages) {
+
+            $result = & $pkgconf --cflags-only-I $package 2>&1
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Could not query include flags for $package"
+              continue
+            }
+
+            foreach ($token in ($result -split '\s+')) {
+
+              if ([string]::IsNullOrWhiteSpace($token)) {
+                continue
+              }
+
+              if ($token.StartsWith("-I")) {
+
+                $path = $token.Substring(2).Trim('"')
+
+                $path = $path -replace '/', '\'
+
+                if ($path.Length -gt 0) {
+                  [void]$includeDirs.Add($path)
+                }
+              }
+            }
+          }
+
+          # Explicit known include locations for Windows/vcpkg layouts.
+          $knownDirectories = @(
+            "$installed\include",
+            "$installed\include\glib-2.0",
+            "$installed\lib\glib-2.0\include",
+            "$installed\include\libxml2",
+
+            # FIX:
+            # vcpkg/libusb places libusb.h under include\libusb-1.0.
+            "$installed\include\libusb-1.0",
+
+            "$installed\include\pthread",
+            "$installed\include\sigc++-2.0",
+            "$installed\include\glibmm-2.66",
+            "$installed\include\glibmm-2.68",
+            "$installed\include\giomm-2.66",
+            "$installed\include\giomm-2.68"
+          )
+
+          foreach ($directory in $knownDirectories) {
+            if (Test-Path $directory) {
+              [void]$includeDirs.Add($directory)
+            }
+          }
+
+          Write-Host ""
+          Write-Host "==============================================================="
+          Write-Host "Resolved include directories"
+          Write-Host "==============================================================="
+
+          foreach ($directory in $includeDirs) {
+            Write-Host "  $directory"
+          }
+
+          $flags = @()
+
+          foreach ($directory in $includeDirs) {
+            $escaped = $directory.Replace('"', '""')
+            $flags += "/I`"$escaped`""
+          }
+
+          $includeFlags = $flags -join " "
+
+          Write-Host ""
+          Write-Host "==============================================================="
+          Write-Host "Generated MSVC include flags"
+          Write-Host "==============================================================="
+          Write-Host $includeFlags
+
+          "CFLAGS=$includeFlags $env:CFLAGS" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          "CXXFLAGS=$includeFlags $env:CXXFLAGS" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          $includeEnvironment = $includeDirs -join ";"
+
+          "INCLUDE=$includeEnvironment;$env:INCLUDE" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          Write-Host ""
+          Write-Host "MSVC include flags configured."
+
+      # ================================================================
+      # 13. VERIFY IMPORTANT MSVC HEADERS
+      # ================================================================
+      - name: Verify MSVC dependency headers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $testDir = "$env:RUNNER_TEMP\ardour-header-test"
+
+          if (Test-Path $testDir) {
+            Remove-Item `
+              $testDir `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $testDir |
+            Out-Null
+
+          @'
+          #include <glib.h>
+          #include <glibmm.h>
+          #include <sigc++/trackable.h>
+          #include <libxml/parser.h>
+          #include <libusb.h>
+
+          int main()
+          {
+              return 0;
+          }
+          '@ | Set-Content `
+            -Path "$testDir\test.cpp" `
+            -Encoding utf8
+
+          Write-Host "Testing MSVC dependency headers..."
+
+          & cl `
+            /nologo `
+            /EHsc `
+            /c `
+            "$testDir\test.cpp" `
+            /Fo"$testDir\test.obj"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSVC cannot see one or more required Ardour dependency headers."
+          }
+
+          Write-Host ""
+          Write-Host "Header visibility test passed."
+          Write-Host "  glib.h"
+          Write-Host "  glibmm.h"
+          Write-Host "  sigc++/trackable.h"
+          Write-Host "  libxml/parser.h"
+          Write-Host "  libusb.h"
+
+      # ================================================================
+      # 14. VERIFY PKG-CONFIG
+      # ================================================================
+      - name: Verify pkg-config dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $packages = @(
+            "glib-2.0",
+            "gobject-2.0",
+            "gio-2.0",
+            "gmodule-2.0",
+            "gthread-2.0",
+            "glibmm-2.4",
+            "giomm-2.4",
+            "sigc++-2.0",
+            "cairo",
+            "cairomm-1.0",
+            "pango",
+            "pangomm-1.4",
+            "pangocairo",
+            "libxml-2.0",
+            "libpng",
+            "sndfile",
+            "samplerate",
+            "fftw3",
+            "flac",
+            "lilv-0",
+            "serd-0",
+            "sord-0",
+            "sratom-0",
+            "rubberband",
+            "liblo",
+            "portaudio-2.0",
+            "aubio"
+          )
+
+          foreach ($package in $packages) {
+
+            $null = & $env:PKG_CONFIG --exists $package 2>&1
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "pkg-config cannot find required package: $package"
+            }
+
+            $version = (
+              & $env:PKG_CONFIG --modversion $package 2>&1
+            ) -join ""
+
+            Write-Host "OK  $package ($version)"
+          }
+
+          Write-Host ""
+          Write-Host "All pkg-config dependency checks passed."
+
+      # ================================================================
+      # 15. CLEAN PREVIOUS WAF BUILD STATE
       #
-      # This makes debugging reliable. It is slower than incremental
-      # builds, but avoids stale Waf/MSVC configuration.
-      # ------------------------------------------------------------
+      # Ensures a fully clean configure/build on every run. Slower than
+      # an incremental build, but avoids stale Waf/MSVC configuration
+      # left over from a prior cache restore or reused workspace.
+      # ================================================================
       - name: Clean Waf build state
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -556,63 +681,30 @@ jobs:
 
           Write-Host "Waf build state cleaned."
 
-      # ------------------------------------------------------------
-      # Configure Ardour
-      # ------------------------------------------------------------
-      - name: Configure Ardour
-        shell: powershell
+      # ================================================================
+      # 16. WAF CONFIGURE
+      # ================================================================
+      - name: waf configure
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $env:VCPKG_ROOT = "C:\vcpkg"
-
-          $prefix = "$env:GITHUB_WORKSPACE\dist"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $prefix | Out-Null
-
-          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
-          Write-Host "INSTALL_DIR=$prefix"
-          Write-Host ""
-
-          Write-Host "Compiler:"
-          where.exe cl.exe
-          cl.exe 2>&1 | Select-Object -First 5
-
-          Write-Host ""
-          Write-Host "Python:"
-          python --version
-
-          Write-Host ""
-          Write-Host "Waf:"
-          python waf --version
-
-          Write-Host ""
-          Write-Host "Git:"
-          git describe --tags --always --dirty
-
-          Write-Host ""
-          Write-Host "LLVM:"
-          if ($env:LLVM_PATH) {
-            Write-Host "LLVM_PATH=$env:LLVM_PATH"
-          }
+          $installed = $env:VCPKG_INSTALLED
 
           $args = @(
             "configure",
-            "--prefix=$prefix",
+            "--prefix=$env:INSTALL_DIR",
             "--configdir=share",
-            "--ptformat",
             "--dist-target=msvc",
-            "--also-include=C:\vcpkg\installed\x64-windows\include",
-            "--also-libdir=C:\vcpkg\installed\x64-windows\lib",
-            "--cxx17",
-            "--use-lld",
-            "--optimize"
+            "--also-include=$installed\include",
+            "--also-libdir=$installed\lib",
+            "--cxx17"
           )
 
-          if ("${{ github.event.inputs.build_type }}" -eq "Debug") {
+          if ("${{ inputs.build_type }}" -eq "Release") {
+            $args += "--optimize"
+          }
+          else {
             $args += "--debug"
           }
 
@@ -623,101 +715,149 @@ jobs:
 
           python waf @args
 
-      # ------------------------------------------------------------
-      # Build
-      # ------------------------------------------------------------
-      - name: Build Ardour
-        shell: powershell
+      # ================================================================
+      # 17. CONFIGURE LOGS
+      # ================================================================
+      - name: Upload configure logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ardour-config-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}\build\config.log
+            ${{ github.workspace }}\build\config.summary
+            ${{ github.workspace }}\build\config.errors
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ================================================================
+      # 18. BUILD
+      # ================================================================
+      - name: waf build
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # GitHub's Windows runner has multiple CPU cores.
-          # 4 is conservative and avoids making the runner
-          # completely memory-starved.
-          $jobs = [Math]::Min(
-            [Environment]::ProcessorCount,
-            4
-          )
+          $jobs = [Environment]::ProcessorCount
 
-          Write-Host "CPU cores: $([Environment]::ProcessorCount)"
-          Write-Host "Waf jobs: $jobs"
-          Write-Host ""
+          Write-Host "Building Ardour with $jobs parallel jobs."
 
           python waf build -j $jobs
 
-      # ------------------------------------------------------------
-      # Install
-      # ------------------------------------------------------------
-      - name: Install Ardour
-        shell: powershell
+      # ================================================================
+      # 19. BUILD LOGS
+      # ================================================================
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ardour-build-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}\build
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ================================================================
+      # 20. INSTALL
+      # ================================================================
+      - name: waf install
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
-          $prefix = "$env:GITHUB_WORKSPACE\dist"
-
-          if (Test-Path $prefix) {
-            Remove-Item `
-              -Recurse `
-              -Force `
-              $prefix
-          }
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $prefix | Out-Null
-
           python waf install
 
-      # ------------------------------------------------------------
-      # Show final build contents
-      # ------------------------------------------------------------
-      - name: Verify installed files
-        shell: powershell
+      # ================================================================
+      # 21. BUNDLE RUNTIME DLLS
+      # ================================================================
+      - name: Bundle runtime DLLs
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $prefix = "$env:GITHUB_WORKSPACE\dist"
+          $vcpkgBin = "$env:VCPKG_INSTALLED\bin"
+          $installRoot = "$env:INSTALL_DIR"
+
+          if (!(Test-Path $vcpkgBin)) {
+            throw "vcpkg runtime directory not found: $vcpkgBin"
+          }
+
+          $executables = @(
+            Get-ChildItem `
+              -Path $installRoot `
+              -Recurse `
+              -Filter "*.exe" `
+              -File
+          )
+
+          if ($executables.Count -eq 0) {
+            throw "No executable files were installed."
+          }
+
+          $dlls = @(
+            Get-ChildItem `
+              -Path $vcpkgBin `
+              -Filter "*.dll" `
+              -File
+          )
+
+          if ($dlls.Count -eq 0) {
+            throw "No vcpkg runtime DLLs were found."
+          }
+
+          $directories = $executables |
+            Select-Object `
+              -ExpandProperty DirectoryName `
+              -Unique
+
+          foreach ($directory in $directories) {
+
+            Write-Host ""
+            Write-Host "Copying $($dlls.Count) DLLs to:"
+            Write-Host $directory
+
+            Copy-Item `
+              -Path $dlls.FullName `
+              -Destination $directory `
+              -Force
+          }
+
+      # ================================================================
+      # 22. VALIDATE
+      # ================================================================
+      - name: Validate installed build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $executables = @(
+            Get-ChildItem `
+              -Path $env:INSTALL_DIR `
+              -Recurse `
+              -Filter "*.exe" `
+              -File
+          )
+
+          if ($executables.Count -eq 0) {
+            throw "No executable was found after installation."
+          }
 
           Write-Host ""
-          Write-Host "Installed files:"
-          Write-Host "----------------"
+          Write-Host "Installed executables:"
 
-          Get-ChildItem `
-            -Path $prefix `
-            -Recurse `
-            -File `
-            -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length |
-            Format-Table -AutoSize
-
-          $exe = Get-ChildItem `
-            -Path $prefix `
-            -Recurse `
-            -Filter "ardour*.exe" `
-            -File `
-            -ErrorAction SilentlyContinue
-
-          if ($exe) {
-            Write-Host ""
-            Write-Host "Found Ardour executables:"
-            $exe | ForEach-Object {
-              Write-Host $_.FullName
-            }
-          }
-          else {
-            Write-Host ""
-            Write-Host "WARNING: No Ardour executable was found in dist."
+          $executables | ForEach-Object {
+            Write-Host "  $($_.FullName)"
           }
 
-      # ------------------------------------------------------------
-      # Package artifact
-      # ------------------------------------------------------------
+          Write-Host ""
+          Write-Host "Ardour installation validation passed."
+
+      # ================================================================
+      # 23. UPLOAD ARTIFACT
+      # ================================================================
       - name: Upload Ardour artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ardour-windows-msvc-${{ github.event.inputs.build_type }}
-          path: |
-            dist/**
+          name: ardour-windows-msvc-${{ inputs.build_type }}-${{ github.run_number }}
+          path: ${{ env.INSTALL_DIR }}
           if-no-files-found: error
           retention-days: 14
