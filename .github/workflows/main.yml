@@ -19,8 +19,9 @@ on:
         type: string
 
 env:
-  # Use our own standalone vcpkg. Do not use VCPKG_ROOT because
-  # Visual Studio on the GitHub runner already defines that variable.
+  # IMPORTANT:
+  # Do NOT use VCPKG_ROOT here. Visual Studio on the GitHub runner
+  # already defines VCPKG_ROOT and points it at VS's bundled vcpkg.
   VCPKG_HOME: C:\vcpkg
   VCPKG_TRIPLET: x64-windows
   INSTALL_DIR: ${{ github.workspace }}\dist
@@ -38,11 +39,82 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
           filter: blob:none
           submodules: recursive
 
       # ================================================================
-      # 2. TOOLCHAIN
+      # 2. FETCH ARDOUR UPSTREAM TAGS
+      # ================================================================
+      # Ardour's wscript uses `git describe HEAD` to determine the
+      # Ardour version. A fork can have complete Git history but still
+      # lack reachable Ardour release tags.
+      #
+      # Fetch the official Ardour tags explicitly before configuring.
+      # This also performs an early diagnostic so we don't waste a
+      # long build if the checked-out commit cannot be described.
+      # ================================================================
+      - name: Fetch Ardour upstream tags
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Fetching Ardour upstream tags..."
+
+          $existingRemote = git remote get-url upstream 2>$null
+
+          if ($LASTEXITCODE -ne 0) {
+            git remote add upstream https://github.com/Ardour/ardour.git
+          }
+          else {
+            Write-Host "Upstream remote already exists:"
+            Write-Host $existingRemote
+          }
+
+          git fetch upstream --tags --force --prune
+
+          Write-Host ""
+          Write-Host "Recent Ardour tags:"
+          git tag --sort=-version:refname |
+            Select-Object -First 20
+
+          Write-Host ""
+          Write-Host "Tags reachable from HEAD:"
+
+          $reachableTags = @(
+            git tag --merged HEAD
+          )
+
+          if ($reachableTags.Count -eq 0) {
+            Write-Host ""
+            Write-Host "No tags are reachable from the checked-out HEAD."
+            Write-Host ""
+            Write-Host "Current HEAD:"
+            git log -1 --oneline --decorate
+            Write-Host ""
+            Write-Host "This usually means the fork branch contains commits that are"
+            Write-Host "not descendants of an official Ardour tagged commit."
+
+            throw "No Ardour release tag is reachable from HEAD."
+          }
+
+          $reachableTags |
+            Select-Object -Last 20
+
+          Write-Host ""
+          Write-Host "Testing git describe HEAD..."
+
+          $describe = git describe HEAD 2>&1
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error ($describe -join "`n")
+            throw "git describe HEAD failed even after fetching Ardour tags."
+          }
+
+          Write-Host "git describe HEAD = $($describe -join '')"
+
+      # ================================================================
+      # 3. TOOLCHAIN
       # ================================================================
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,7 +143,7 @@ jobs:
           }
 
       # ================================================================
-      # 3. VCPKG TOOL CACHE
+      # 4. VCPKG TOOL CACHE
       # ================================================================
       - name: Restore vcpkg tool cache
         uses: actions/cache@v4
@@ -84,14 +156,15 @@ jobs:
             ardour-vcpkg-tool-${{ runner.os }}-
 
       # ================================================================
-      # 4. STANDALONE VCPKG
+      # 5. STANDALONE VCPKG
       # ================================================================
       - name: Set up standalone vcpkg
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Do not let Visual Studio's bundled vcpkg interfere.
+          # Visual Studio defines this itself. Remove it so child
+          # processes cannot accidentally select VS's bundled vcpkg.
           Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
 
           $vcpkg = $env:VCPKG_HOME
@@ -101,14 +174,16 @@ jobs:
           if (!(Test-Path "$vcpkg\.git")) {
 
             if (Test-Path $vcpkg) {
-              Write-Host "C:\vcpkg exists but is not a Git repository."
-              Write-Host "Removing it..."
+              Write-Host "Existing C:\vcpkg is not a Git repository."
+              Write-Host "Removing it before cloning a clean copy."
 
               Remove-Item `
                 -Path $vcpkg `
                 -Recurse `
                 -Force
             }
+
+            Write-Host "Cloning standalone vcpkg..."
 
             git clone `
               https://github.com/microsoft/vcpkg.git `
@@ -146,7 +221,7 @@ jobs:
           Write-Host "Standalone vcpkg is ready."
 
       # ================================================================
-      # 5. DEPENDENCY CACHE
+      # 6. VCPKG DEPENDENCY CACHE
       # ================================================================
       - name: Restore vcpkg dependency cache
         uses: actions/cache@v4
@@ -163,7 +238,7 @@ jobs:
             ardour-deps-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-
 
       # ================================================================
-      # 6. ARDOUR MSVC DEPENDENCY HELPER
+      # 7. DOWNLOAD ARDOUR MSVC DEPENDENCY HELPER
       # ================================================================
       - name: Download Ardour dependency helper
         shell: pwsh
@@ -184,7 +259,7 @@ jobs:
           Write-Host "Downloaded Ardour dependency helper."
 
       # ================================================================
-      # 7. USE OUR C:\VCPKG
+      # 8. POINT DEPENDENCY HELPER AT OUR VCPKG
       # ================================================================
       - name: Configure dependency helper
         shell: pwsh
@@ -197,8 +272,6 @@ jobs:
             -Path $file `
             -Raw
 
-          # The published helper expects a vcpkg checkout next to itself.
-          # Replace ONLY that path with our standalone cached vcpkg.
           $old = '_vcpkg_dir = _script_dir / "vcpkg"'
           $new = '_vcpkg_dir = Path(r"C:\vcpkg")'
 
@@ -206,7 +279,7 @@ jobs:
             $text = $text.Replace($old, $new)
           }
           else {
-            Write-Host "Helper already appears to use an external vcpkg path."
+            Write-Host "Dependency helper already appears to use an external vcpkg path."
           }
 
           Set-Content `
@@ -214,8 +287,10 @@ jobs:
             -Value $text `
             -Encoding utf8
 
+          Write-Host "Dependency helper configured."
+
       # ================================================================
-      # 8. INSTALL ARDOUR DEPENDENCIES
+      # 9. INSTALL ARDOUR DEPENDENCIES
       # ================================================================
       - name: Install Ardour dependencies
         shell: pwsh
@@ -228,12 +303,12 @@ jobs:
             throw "Expected vcpkg installed tree was not created."
           }
 
-          Write-Host "Ardour dependency helper completed."
+          Write-Host "Ardour dependency installation completed."
 
       # ================================================================
-      # 9. CONFIGURE VCPKG ENVIRONMENT
+      # 10. CONFIGURE VCPKG BUILD ENVIRONMENT
       # ================================================================
-      - name: Configure vcpkg environment
+      - name: Configure build environment
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -243,7 +318,7 @@ jobs:
           $pkgconfExe = "$pkgconfDir\pkgconf.exe"
 
           if (!(Test-Path $installed)) {
-            throw "Installed vcpkg tree does not exist: $installed"
+            throw "Installed dependency tree not found: $installed"
           }
 
           if (!(Test-Path $pkgconfExe)) {
@@ -256,7 +331,7 @@ jobs:
               -Encoding utf8 `
               -Append
 
-          # vcpkg first.
+          # Make vcpkg headers/libs visible to MSVC and Waf.
           "INCLUDE=$installed\include;$env:INCLUDE" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -269,6 +344,7 @@ jobs:
               -Encoding utf8 `
               -Append
 
+          # Make pkg-config see both standard vcpkg databases.
           "PKG_CONFIG_PATH=$installed\lib\pkgconfig;$installed\share\pkgconfig" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
@@ -293,16 +369,10 @@ jobs:
               -Encoding utf8 `
               -Append
 
+          Write-Host "vcpkg build environment configured."
+
       # ================================================================
-      # 10. SELF-HEAL KNOWN MISSING VCPKG PACKAGES
-      # ================================================================
-      # This does NOT install random packages based on arbitrary words
-      # in a Waf error. Instead it checks the known Ardour MSVC package
-      # set and installs missing ports automatically.
-      #
-      # The Ardour MSVC documentation lists this family of packages,
-      # including aubio[core], libarchive, vamp-sdk, libusb, jack2,
-      # web sockets, multiple Boost components, etc.
+      # 11. SELF-HEAL KNOWN DEPENDENCIES
       # ================================================================
       - name: Self-heal missing dependencies
         shell: pwsh
@@ -311,7 +381,10 @@ jobs:
 
           $vcpkg = "$env:VCPKG_HOME\vcpkg.exe"
           $triplet = $env:VCPKG_TRIPLET
+          $root = $env:VCPKG_INSTALLED
+          $pc = $env:PKG_CONFIG
 
+          # Known Ardour/MSVC dependency set.
           $packages = @(
             "boost-ptr-container",
             "boost-uuid",
@@ -322,7 +395,12 @@ jobs:
             "boost-property-tree",
             "boost-multi-array",
             "glib",
+            "glibmm",
+            "libsigcpp",
+            "cairomm",
+            "pangomm",
             "libsndfile",
+            "libsamplerate",
             "curl",
             "libarchive",
             "liblo",
@@ -341,30 +419,33 @@ jobs:
             "cppunit",
             "libwebsockets",
             "portaudio[asio]",
-            "libsamplerate",
             "serd",
             "sord",
             "sratom",
             "lilv",
+            "libflac",
             "getopt"
           )
 
-          Write-Host "Checking the Ardour MSVC dependency package set..."
+          Write-Host ""
+          Write-Host "==============================================================="
+          Write-Host "Checking known Ardour MSVC dependency ports"
+          Write-Host "==============================================================="
 
-          # Ask vcpkg which packages are already installed.
-          $installedList = & $vcpkg list
+          $installedList = @(
+            & $vcpkg list
+          )
 
-          $missingPorts = @()
+          $missing = @()
 
           foreach ($package in $packages) {
 
-            # Strip feature syntax for the package-name lookup.
             $base = $package.Split("[")[0]
 
             $found = $false
 
             foreach ($line in $installedList) {
-              if ($line -match "^\s*$base") {
+              if ($line -match "^\s*$([regex]::Escape($base))\s*:") {
                 $found = $true
                 break
               }
@@ -375,38 +456,37 @@ jobs:
             }
             else {
               Write-Warning "MISSING $package"
-              $missingPorts += $package
+              $missing += $package
             }
           }
 
-          if ($missingPorts.Count -gt 0) {
+          if ($missing.Count -gt 0) {
 
             Write-Host ""
-            Write-Host "Installing missing packages:"
-            $missingPorts | ForEach-Object {
+            Write-Host "Installing missing dependency ports..."
+
+            $missing | ForEach-Object {
               Write-Host "  $_"
             }
 
             & $vcpkg install `
-              @missingPorts `
+              @missing `
               --triplet $triplet `
               --no-print-usage
 
             if ($LASTEXITCODE -ne 0) {
-              throw "Automatic installation of one or more missing vcpkg packages failed."
+              throw "One or more missing dependency ports could not be installed."
             }
-
-            Write-Host "Missing package installation completed."
           }
           else {
-            Write-Host "All known Ardour MSVC vcpkg packages are already installed."
+            Write-Host "All known dependency ports are installed."
           }
 
       # ================================================================
-      # 11. RUN ARDOUR HELPER AGAIN
+      # 12. RE-APPLY ARDOUR WINDOWS FIXES
       # ================================================================
-      # This matters because the helper creates/fixes metadata such as
-      # aubio.pc and other Windows-specific dependency details.
+      # Important because the helper may create aubio.pc and fix
+      # Windows-specific .pc and library names after installation.
       # ================================================================
       - name: Re-apply Ardour dependency fixes
         shell: pwsh
@@ -415,10 +495,10 @@ jobs:
 
           python "$env:GITHUB_WORKSPACE\InstallDependencies.vcpkg.py"
 
-          Write-Host "Ardour dependency fixes re-applied."
+          Write-Host "Ardour dependency fixes applied."
 
       # ================================================================
-      # 12. VERIFY DEPENDENCIES
+      # 13. VERIFY DEPENDENCIES
       # ================================================================
       - name: Verify dependencies
         shell: pwsh
@@ -427,10 +507,6 @@ jobs:
 
           $root = $env:VCPKG_INSTALLED
           $pc = $env:PKG_CONFIG
-
-          if (!$pc -or !(Test-Path $pc)) {
-            throw "PKG_CONFIG is not valid: $pc"
-          }
 
           function Require-Header {
             param([string]$Path)
@@ -450,17 +526,17 @@ jobs:
 
             $null = & $pc --exists $Name 2>&1
 
-            if ($LASTEXITCODE -eq 0) {
-              $version = (& $pc --modversion $Name 2>&1) -join ""
-              Write-Host "OK PKG     $Name ($version)"
-            }
-            else {
+            if ($LASTEXITCODE -ne 0) {
               throw "Missing required pkg-config package: $Name"
             }
+
+            $version = (& $pc --modversion $Name 2>&1) -join ""
+
+            Write-Host "OK PKG     $Name ($version)"
           }
 
           Write-Host ""
-          Write-Host "=== Core headers ==="
+          Write-Host "=== Required headers ==="
 
           Require-Header "boost/version.hpp"
           Require-Header "boost/ptr_container/ptr_list.hpp"
@@ -475,7 +551,7 @@ jobs:
           Require-Header "pthread.h"
 
           Write-Host ""
-          Write-Host "=== Core pkg-config packages ==="
+          Write-Host "=== Required pkg-config packages ==="
 
           Require-Pkg "glib-2.0"
           Require-Pkg "sndfile"
@@ -489,7 +565,7 @@ jobs:
           Require-Pkg "aubio"
 
           Write-Host ""
-          Write-Host "=== GTKmm-compatible packages ==="
+          Write-Host "=== GTKmm family ==="
 
           Require-Pkg "glibmm-2.4"
           Require-Pkg "giomm-2.4"
@@ -498,124 +574,7 @@ jobs:
           Require-Pkg "pangomm-1.4"
 
           Write-Host ""
-          Write-Host "All dependency verification checks passed."
-
-      # ================================================================
-      # 13. DETECT GTKMM PACKAGE NAMES
-      # ================================================================
-      - name: Detect GTKmm package names
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $pc = $env:PKG_CONFIG
-
-          function Find-PackageName {
-            param([string[]]$Candidates)
-
-            foreach ($name in $Candidates) {
-              $null = & $pc --exists $name 2>&1
-
-              if ($LASTEXITCODE -eq 0) {
-                return $name
-              }
-            }
-
-            return $null
-          }
-
-          $glibmm = Find-PackageName @(
-            "glibmm-2.4",
-            "glibmm-2.68"
-          )
-
-          $giomm = Find-PackageName @(
-            "giomm-2.4",
-            "giomm-2.68"
-          )
-
-          $sigc = Find-PackageName @(
-            "sigc++-2.0",
-            "sigc++-3.0"
-          )
-
-          $cairomm = Find-PackageName @(
-            "cairomm-1.0",
-            "cairomm-1.16"
-          )
-
-          $pangomm = Find-PackageName @(
-            "pangomm-1.4",
-            "pangomm-2.48"
-          )
-
-          Write-Host "glibmm : $glibmm"
-          Write-Host "giomm  : $giomm"
-          Write-Host "sigc++ : $sigc"
-          Write-Host "cairomm: $cairomm"
-          Write-Host "pangomm: $pangomm"
-
-          if (!$glibmm -or !$giomm -or !$sigc -or !$cairomm -or !$pangomm) {
-            throw "Unable to resolve the GTKmm dependency names."
-          }
-
-          # Top-level Waf.
-          $wscript = Get-Content "wscript" -Raw
-
-          if ($glibmm -ne "glibmm-2.4") {
-            $wscript = $wscript -replace `
-              [regex]::Escape("glibmm-2.4"), `
-              $glibmm
-          }
-
-          if ($giomm -ne "giomm-2.4") {
-            $wscript = $wscript -replace `
-              [regex]::Escape("giomm-2.4"), `
-              $giomm
-          }
-
-          Set-Content `
-            "wscript" `
-            $wscript `
-            -NoNewline
-
-          # ztkmm.
-          if (Test-Path "libs/tk/ztkmm/wscript") {
-            $ztk = Get-Content "libs/tk/ztkmm/wscript" -Raw
-
-            if ($sigc -ne "sigc++-2.0") {
-              $ztk = $ztk -replace `
-                [regex]::Escape("sigc++-2.0"), `
-                $sigc
-            }
-
-            Set-Content `
-              "libs/tk/ztkmm/wscript" `
-              $ztk `
-              -NoNewline
-          }
-
-          # ydkmm.
-          if (Test-Path "libs/tk/ydkmm/wscript") {
-            $ydk = Get-Content "libs/tk/ydkmm/wscript" -Raw
-
-            if ($cairomm -ne "cairomm-1.0") {
-              $ydk = $ydk -replace `
-                [regex]::Escape("cairomm-1.0"), `
-                $cairomm
-            }
-
-            if ($pangomm -ne "pangomm-1.4") {
-              $ydk = $ydk -replace `
-                [regex]::Escape("pangomm-1.4"), `
-                $pangomm
-            }
-
-            Set-Content `
-              "libs/tk/ydkmm/wscript" `
-              $ydk `
-              -NoNewline
-          }
+          Write-Host "All dependency checks passed."
 
       # ================================================================
       # 14. WAF CONFIGURE
@@ -645,8 +604,10 @@ jobs:
             $args += "--debug"
           }
 
+          Write-Host ""
           Write-Host "Running:"
           Write-Host "python waf $($args -join ' ')"
+          Write-Host ""
 
           python waf @args
 
@@ -675,7 +636,7 @@ jobs:
 
           $jobs = [Environment]::ProcessorCount
 
-          Write-Host "Building with $jobs parallel jobs."
+          Write-Host "Building Ardour with $jobs parallel jobs."
 
           python waf build -j $jobs
 
@@ -702,7 +663,7 @@ jobs:
           python waf install
 
       # ================================================================
-      # 19. BUNDLE DLLS
+      # 19. BUNDLE RUNTIME DLLs
       # ================================================================
       - name: Bundle runtime DLLs
         shell: pwsh
@@ -716,23 +677,27 @@ jobs:
             throw "vcpkg runtime directory not found: $vcpkgBin"
           }
 
-          $executables = Get-ChildItem `
-            -Path $installRoot `
-            -Recurse `
-            -Filter "*.exe" `
-            -File
+          $executables = @(
+            Get-ChildItem `
+              -Path $installRoot `
+              -Recurse `
+              -Filter "*.exe" `
+              -File
+          )
 
           if ($executables.Count -eq 0) {
-            throw "No executable files were installed."
+            throw "No executable files were installed under $installRoot"
           }
 
-          $dlls = Get-ChildItem `
-            -Path $vcpkgBin `
-            -Filter "*.dll" `
-            -File
+          $dlls = @(
+            Get-ChildItem `
+              -Path $vcpkgBin `
+              -Filter "*.dll" `
+              -File
+          )
 
           if ($dlls.Count -eq 0) {
-            throw "No vcpkg runtime DLLs were found."
+            throw "No vcpkg DLLs found in $vcpkgBin"
           }
 
           $directories = $executables |
@@ -741,7 +706,10 @@ jobs:
               -Unique
 
           foreach ($directory in $directories) {
-            Write-Host "Copying $($dlls.Count) DLLs to $directory"
+
+            Write-Host ""
+            Write-Host "Copying $($dlls.Count) DLLs to:"
+            Write-Host $directory
 
             Copy-Item `
               -Path $dlls.FullName `
@@ -757,11 +725,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $executables = Get-ChildItem `
-            -Path $env:INSTALL_DIR `
-            -Recurse `
-            -Filter "*.exe" `
-            -File
+          $executables = @(
+            Get-ChildItem `
+              -Path $env:INSTALL_DIR `
+              -Recurse `
+              -Filter "*.exe" `
+              -File
+          )
 
           if ($executables.Count -eq 0) {
             throw "No executable was found after installation."
@@ -775,10 +745,10 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "Ardour build validation passed."
+          Write-Host "Ardour installation validation passed."
 
       # ================================================================
-      # 21. ARTIFACT
+      # 21. UPLOAD ARTIFACT
       # ================================================================
       - name: Upload Ardour artifact
         uses: actions/upload-artifact@v4
