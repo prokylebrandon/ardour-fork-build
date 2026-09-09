@@ -1,4 +1,3 @@
-
 name: Build Ardour (Windows / MSVC)
 
 on:
@@ -862,4 +861,55 @@ jobs:
       - name: Install Ardour
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "============================================================"
+          Write-Host "INSTALLING ARDOUR"
+          Write-Host "============================================================"
+
+          python waf install
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Waf install failed with exit code $LASTEXITCODE"
+          }
+
+
+      # ============================================================
+      # SHOW OUTPUT
+      # ============================================================
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "============================================================"
+          Write-Host "BUILD OUTPUT"
+          Write-Host "============================================================"
+
+          if (-not (Test-Path "$env:INSTALL_DIR")) {
+            throw "Install directory does not exist: $env:INSTALL_DIR"
+          }
+
+          Get-ChildItem `
+            -Path "$env:INSTALL_DIR" `
+            -Recurse |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
+
+          Write-Host ""
+          Write-Host "Installed files:"
+          (Get-ChildItem "$env:INSTALL_DIR" -Recurse -File).Count
+
+
+      # ============================================================
+      # UPLOAD ARTIFACT
+      # ============================================================
+
+      - name: Upload Ardour build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ardour-windows-msvc-${{ inputs.build_type }}
+          path: ${{ env.INSTALL_DIR }}
+          if-no-files-found: error
+          compression-level: 6
