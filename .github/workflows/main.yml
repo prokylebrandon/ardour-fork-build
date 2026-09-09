@@ -20,6 +20,7 @@ on:
 
 env:
   VCPKG_HOME: C:\vcpkg
+  VCPKG_ROOT: C:\vcpkg
   VCPKG_TRIPLET: x64-windows
   INSTALL_DIR: ${{ github.workspace }}\dist
 
@@ -83,14 +84,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # Git / Ardour version information
-      #
-      # Ardour's Waf build uses:
-      #
-      #     git describe HEAD
-      #
-      # The fork may not have Ardour's upstream tags, so explicitly
-      # fetch them from the official Ardour repository.
+      # Fetch official Ardour tags
       # ------------------------------------------------------------
       - name: Fetch Ardour upstream tags
         shell: pwsh
@@ -105,7 +99,7 @@ jobs:
           git describe HEAD
 
       # ------------------------------------------------------------
-      # vcpkg
+      # Cache vcpkg
       # ------------------------------------------------------------
       - name: Cache vcpkg
         id: cache-vcpkg
@@ -114,6 +108,9 @@ jobs:
           path: C:\vcpkg
           key: windows-2022-vcpkg-${{ runner.arch }}-${{ hashFiles('**/InstallDependencies.vcpkg.py') }}
 
+      # ------------------------------------------------------------
+      # Install standalone vcpkg
+      # ------------------------------------------------------------
       - name: Install vcpkg
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         shell: pwsh
@@ -126,7 +123,7 @@ jobs:
 
           Set-Location C:\vcpkg
 
-          .\bootstrap-vcpkg.bat
+          .\bootstrap-vcpkg.bat -disableMetrics
 
       # ------------------------------------------------------------
       # Optional vcpkg pin
@@ -141,36 +138,57 @@ jobs:
 
           git checkout "${{ inputs.vcpkg_ref }}"
 
-          .\bootstrap-vcpkg.bat
+          .\bootstrap-vcpkg.bat -disableMetrics
 
       # ------------------------------------------------------------
-      # Do NOT let vcpkg's environment integration override the
-      # standalone C:\vcpkg installation.
+      # Verify vcpkg environment
       # ------------------------------------------------------------
-      - name: Configure vcpkg environment
+      - name: Verify vcpkg
         shell: pwsh
         run: |
-          Add-Content $env:GITHUB_ENV "VCPKG_ROOT="
+          $env:VCPKG_ROOT = "C:\vcpkg"
 
-          $env:VCPKG_ROOT = $null
-
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
           Write-Host "VCPKG_HOME=$env:VCPKG_HOME"
           Write-Host "VCPKG_TRIPLET=$env:VCPKG_TRIPLET"
 
+          if (-not (Test-Path "C:\vcpkg\vcpkg.exe")) {
+            Write-Error "C:\vcpkg\vcpkg.exe does not exist."
+            exit 1
+          }
+
+          & "C:\vcpkg\vcpkg.exe" version
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "vcpkg version command failed."
+            exit $LASTEXITCODE
+          }
+
       # ------------------------------------------------------------
-      # Download Ardour's MSVC dependency helper
+      # Download dependency helper
       # ------------------------------------------------------------
       - name: Download Ardour MSVC dependency helper
         shell: pwsh
         run: |
+          $helper = "$env:RUNNER_TEMP\InstallDependencies.vcpkg.py"
+
           Invoke-WebRequest `
             -Uri "https://raw.githubusercontent.com/EZ4Stephen/testardourdeps/main/vcpkg-build/InstallDependencies.vcpkg.py" `
-            -OutFile "$env:RUNNER_TEMP\InstallDependencies.vcpkg.py"
+            -OutFile $helper
 
-          Write-Host "Dependency helper downloaded."
+          if (-not (Test-Path $helper)) {
+            Write-Error "Dependency helper was not downloaded."
+            exit 1
+          }
+
+          Write-Host "Downloaded:"
+          Write-Host $helper
 
       # ------------------------------------------------------------
-      # Patch dependency helper to use our standalone vcpkg
+      # Patch dependency helper
+      #
+      # 1. Force it to use C:\vcpkg
+      # 2. Remove shell=True from subprocess.run()
       # ------------------------------------------------------------
       - name: Patch dependency helper
         shell: pwsh
@@ -179,27 +197,52 @@ jobs:
 
           $text = Get-Content $file -Raw
 
-          $old = '_vcpkg_dir = _script_dir / "vcpkg"'
-          $new = '_vcpkg_dir = Path(r"C:\vcpkg")'
+          # Force the helper to use our standalone vcpkg.
+          $oldVcpkg = '_vcpkg_dir = _script_dir / "vcpkg"'
+          $newVcpkg = '_vcpkg_dir = Path(r"C:\vcpkg")'
 
-          if (-not $text.Contains($old)) {
-            Write-Host "Expected vcpkg path line was not found."
-            Write-Host "Searching for vcpkg_dir definitions:"
-            $text -split "`n" |
-              Where-Object { $_ -match "vcpkg_dir" } |
-              ForEach-Object { Write-Host $_ }
-
+          if ($text.Contains($oldVcpkg)) {
+            $text = $text.Replace($oldVcpkg, $newVcpkg)
+          }
+          elseif (-not $text.Contains($newVcpkg)) {
+            Write-Error "Could not find the helper's vcpkg directory definition."
             exit 1
           }
 
-          $text = $text.Replace($old, $new)
+          # Use normal subprocess execution rather than shell=True.
+          #
+          # The upstream helper currently does:
+          #
+          #   subprocess.run(cmd, cwd=cwd, shell=True)
+          #
+          # while cmd is a list. On Windows this can cause command
+          # parsing/path handling problems.
+          $oldRun = 'result = subprocess.run(cmd, cwd=cwd, shell=True)'
+          $newRun = 'result = subprocess.run(cmd, cwd=cwd)'
+
+          if ($text.Contains($oldRun)) {
+            $text = $text.Replace($oldRun, $newRun)
+          }
+          elseif (-not $text.Contains($newRun)) {
+            Write-Error "Could not find the helper subprocess invocation."
+            exit 1
+          }
 
           Set-Content `
             -Path $file `
             -Value $text `
             -Encoding UTF8
 
-          Write-Host "Dependency helper patched to use C:\vcpkg."
+          Write-Host ""
+          Write-Host "Dependency helper patched successfully."
+          Write-Host ""
+
+          Write-Host "Relevant configuration:"
+          $text -split "`n" |
+            Select-String -Pattern "_vcpkg_dir|subprocess.run" |
+            ForEach-Object {
+              Write-Host $_.Line
+            }
 
       # ------------------------------------------------------------
       # Install Ardour dependencies
@@ -207,36 +250,57 @@ jobs:
       - name: Install Ardour dependencies
         shell: pwsh
         env:
+          VCPKG_ROOT: C:\vcpkg
           VCPKG_DEFAULT_TRIPLET: x64-windows
           VCPKG_DEFAULT_HOST_TRIPLET: x64-windows
         run: |
+          $ErrorActionPreference = "Stop"
+
+          $env:VCPKG_ROOT = "C:\vcpkg"
+
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+
+          if (-not (Test-Path "C:\vcpkg\vcpkg.exe")) {
+            Write-Error "vcpkg.exe is missing."
+            exit 1
+          }
+
           python "$env:RUNNER_TEMP\InstallDependencies.vcpkg.py"
 
       # ------------------------------------------------------------
-      # Add vcpkg tools to PATH
+      # Ensure pkgconf is available
       # ------------------------------------------------------------
-      - name: Configure vcpkg tools
+      - name: Configure pkg-config
         shell: pwsh
         run: |
-          $installed = "C:\vcpkg\installed\x64-windows"
+          $pkgconfDir = "C:\vcpkg\installed\x64-windows\tools\pkgconf"
+          $pkgconfExe = Join-Path $pkgconfDir "pkgconf.exe"
+          $pkgconfigExe = Join-Path $pkgconfDir "pkg-config.exe"
 
-          $pkgconfig = "C:\vcpkg\installed\x64-windows\tools\pkgconf"
-
-          if (Test-Path $pkgconfig) {
-            Add-Content $env:GITHUB_PATH $pkgconfig
+          if (-not (Test-Path $pkgconfExe)) {
+            Write-Error "pkgconf.exe was not installed."
+            exit 1
           }
 
-          Add-Content $env:GITHUB_PATH "C:\vcpkg"
+          if (-not (Test-Path $pkgconfigExe)) {
+            Copy-Item $pkgconfExe $pkgconfigExe
+          }
 
-          Write-Host "Installed prefix:"
-          Write-Host $installed
+          Add-Content $env:GITHUB_PATH $pkgconfDir
+
+          $pcPath = "C:\vcpkg\installed\x64-windows\lib\pkgconfig"
+
+          Add-Content $env:GITHUB_ENV "PKG_CONFIG_PATH=$pcPath"
+
+          Write-Host "pkg-config directory:"
+          Write-Host $pkgconfDir
+
+          Write-Host ""
+          Write-Host "pkg-config version:"
+          & $pkgconfigExe --version
 
       # ------------------------------------------------------------
       # Configure include paths
-      #
-      # Some dependencies expose their headers correctly through
-      # pkg-config, but MSVC/Waf does not always propagate those
-      # include directories to every target.
       # ------------------------------------------------------------
       - name: Configure MSVC include paths
         shell: pwsh
@@ -255,6 +319,8 @@ jobs:
             "$installed\include\giomm-2.4",
             "$installed\include\sigc++-3.0",
             "$installed\lib\sigc++-3.0\include",
+            "$installed\include\sigc++-2.0",
+            "$installed\lib\sigc++-2.0\include",
             "$installed\include\cairomm-1.0",
             "$installed\include\pangomm-2.48",
             "$installed\include\pango-1.0",
@@ -264,7 +330,6 @@ jobs:
             "$installed\include\freetype2"
           )
 
-          # Add include directories reported by pkg-config.
           $packages = @(
             "glib-2.0",
             "glibmm-2.4",
@@ -282,7 +347,7 @@ jobs:
 
           foreach ($pkg in $packages) {
             try {
-              $result = & pkgconf --cflags-only-I $pkg 2>$null
+              $result = & pkg-config --cflags-only-I $pkg 2>$null
 
               if ($LASTEXITCODE -eq 0 -and $result) {
                 foreach ($token in ($result -split '\s+')) {
@@ -297,7 +362,7 @@ jobs:
               }
             }
             catch {
-              Write-Host "pkgconf lookup failed for $pkg"
+              Write-Host "pkg-config lookup failed for $pkg"
             }
           }
 
@@ -305,9 +370,10 @@ jobs:
             Where-Object { $_ -and (Test-Path $_) } |
             Sort-Object -Unique
 
+          Write-Host ""
           Write-Host "MSVC include directories:"
-          $includeDirs | ForEach-Object {
-            Write-Host "  $_"
+          foreach ($dir in $includeDirs) {
+            Write-Host "  $dir"
           }
 
           $flags = ($includeDirs | ForEach-Object {
@@ -316,13 +382,42 @@ jobs:
 
           Add-Content $env:GITHUB_ENV "ARDOUR_EXTRA_INCLUDE_FLAGS=$flags"
 
-          Add-Content $env:GITHUB_ENV "INCLUDE=$($includeDirs -join ';')"
+          # Preserve Visual Studio's existing INCLUDE paths and append
+          # the vcpkg paths rather than replacing them.
+          $existingInclude = $env:INCLUDE
 
-          Add-Content $env:GITHUB_ENV "CFLAGS=$flags"
-          Add-Content $env:GITHUB_ENV "CXXFLAGS=$flags"
+          if ($existingInclude) {
+            $newInclude = "$existingInclude;$($includeDirs -join ';')"
+          }
+          else {
+            $newInclude = $includeDirs -join ';'
+          }
+
+          Add-Content $env:GITHUB_ENV "INCLUDE=$newInclude"
+
+          # Do not destroy MSVC defaults. Append vcpkg flags.
+          $existingCFlags = $env:CFLAGS
+          $existingCxxFlags = $env:CXXFLAGS
+
+          if ($existingCFlags) {
+            $finalCFlags = "$existingCFlags $flags"
+          }
+          else {
+            $finalCFlags = $flags
+          }
+
+          if ($existingCxxFlags) {
+            $finalCxxFlags = "$existingCxxFlags $flags"
+          }
+          else {
+            $finalCxxFlags = $flags
+          }
+
+          Add-Content $env:GITHUB_ENV "CFLAGS=$finalCFlags"
+          Add-Content $env:GITHUB_ENV "CXXFLAGS=$finalCxxFlags"
 
       # ------------------------------------------------------------
-      # Verify important headers before starting the large build.
+      # Verify required headers
       # ------------------------------------------------------------
       - name: Verify dependency headers
         shell: pwsh
@@ -345,15 +440,7 @@ jobs:
           }
 
       # ------------------------------------------------------------
-      # IMPORTANT FIX:
-      #
-      # ardour9-lua directly references getopt_long_a on MSVC.
-      #
-      # libpbd contains the getopt implementation, but the symbol
-      # isn't being pulled into the Lua executable correctly.
-      #
-      # Compile the MSVC getopt implementation directly into the
-      # luasession target.
+      # Patch luasession getopt linkage
       # ------------------------------------------------------------
       - name: Patch luasession getopt linkage for MSVC
         shell: pwsh
@@ -366,6 +453,12 @@ jobs:
           }
 
           $text = Get-Content $file -Raw
+
+          # Do not apply the patch twice.
+          if ($text.Contains("../libs/pbd/msvc/getopt.c")) {
+            Write-Host "getopt MSVC patch is already present."
+            exit 0
+          }
 
           $old = @"
           obj.source       = 'luasession.cc'
@@ -385,18 +478,7 @@ jobs:
           "@
 
           if (-not $text.Contains($old)) {
-            Write-Host "Expected luasession source block was not found."
-
-            Write-Host ""
-            Write-Host "Relevant section of luasession/wscript:"
-            Write-Host ""
-
-            $text -split "`n" |
-              Select-String -Pattern "obj.source|obj.target" |
-              ForEach-Object {
-                Write-Host $_.Line
-              }
-
+            Write-Error "Expected luasession source block was not found."
             exit 1
           }
 
@@ -407,36 +489,10 @@ jobs:
             -Value $text `
             -Encoding UTF8
 
-          Write-Host ""
-          Write-Host "Successfully patched luasession/wscript."
-          Write-Host ""
-          Write-Host "MSVC getopt sources added:"
-          Write-Host "  ../libs/pbd/msvc/getopt.c"
-          Write-Host "  ../libs/pbd/msvc/getopt_long.c"
-          Write-Host ""
-
-          Write-Host "Patched section:"
-          Write-Host ""
-
-          $lines = Get-Content $file
-
-          $start = 0
-
-          for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match "obj.source\s*=\s*'luasession.cc'") {
-              $start = [Math]::Max(0, $i - 2)
-              break
-            }
-          }
-
-          $end = [Math]::Min($lines.Count - 1, $start + 15)
-
-          for ($i = $start; $i -le $end; $i++) {
-            Write-Host $lines[$i]
-          }
+          Write-Host "luasession getopt patch applied."
 
       # ------------------------------------------------------------
-      # Waf configure
+      # Configure Waf
       # ------------------------------------------------------------
       - name: Configure Ardour
         shell: pwsh
@@ -447,10 +503,12 @@ jobs:
             "configure",
             "--prefix=$env:INSTALL_DIR",
             "--configdir=share",
+            "--ptformat",
             "--dist-target=msvc",
             "--also-include=C:\vcpkg\installed\x64-windows\include",
             "--also-libdir=C:\vcpkg\installed\x64-windows\lib",
-            "--cxx17"
+            "--cxx17",
+            "--use-lld"
           )
 
           if ("${{ inputs.build_type }}" -eq "Release") {
@@ -470,17 +528,11 @@ jobs:
       # ------------------------------------------------------------
       - name: Build Ardour
         shell: pwsh
-        env:
-          VCPKG_DEFAULT_TRIPLET: x64-windows
-          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows
         run: |
           $ErrorActionPreference = "Stop"
 
           $jobs = [Environment]::ProcessorCount
 
-          # Avoid an excessive number of simultaneous MSVC processes.
-          # 4 is generally a good balance for GitHub-hosted Windows
-          # runners.
           if ($jobs -gt 4) {
             $jobs = 4
           }
@@ -490,7 +542,7 @@ jobs:
           python waf build -j $jobs
 
       # ------------------------------------------------------------
-      # Install / package
+      # Install
       # ------------------------------------------------------------
       - name: Install Ardour
         shell: pwsh
@@ -498,7 +550,7 @@ jobs:
           python waf install
 
       # ------------------------------------------------------------
-      # Show resulting binaries
+      # Show final output
       # ------------------------------------------------------------
       - name: Show build output
         shell: pwsh
@@ -515,11 +567,12 @@ jobs:
               Format-Table -AutoSize
           }
           else {
-            Write-Host "Install directory does not exist."
+            Write-Error "Install directory does not exist."
+            exit 1
           }
 
       # ------------------------------------------------------------
-      # Upload build artifact
+      # Upload artifact
       # ------------------------------------------------------------
       - name: Upload Ardour artifact
         uses: actions/upload-artifact@v4
