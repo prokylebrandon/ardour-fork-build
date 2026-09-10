@@ -169,69 +169,69 @@ jobs:
 
           if (-not (Test-Path $stubPath)) {
             $stubContent = @'
-*
- * getopt_import_stubs_luasession.c
- *
- * Purpose
- * -------
- * Ardour's libs/pbd/msvc/getopt.h marks getopt_a and getopt_long_a as
- * __declspec(dllimport) whenever LIBPBD_DLL is defined without
- * LIBPBD_DLL_EXPORTS (i.e. in any TU that is NOT part of libpbd itself,
- * including luasession).  The compiler therefore emits indirect-call code
- * that dereferences the import-address-table (IAT) pointers:
- *
- *   call QWORD PTR [__imp_getopt_long_a]   ; x64 example
- *
- * Because luasession compiles getopt sources directly (not through
- * libpbd.dll), no DLL import library provides those __imp_ symbols, and
- * the linker reports:
- *
- *   LNK2019: unresolved external symbol __imp_getopt_long_a
- *
- * Fix
- * ---
- * We define __imp_getopt_a and __imp_getopt_long_a here as plain void*
- * variables initialised with the addresses of our locally compiled
- * implementations (getopt_luasession.c / getopt_long_luasession.c).
- * The linker sees these as data symbols, satisfying the IAT-pointer
- * references, and the indirect calls work correctly at runtime.
- *
- * Important: do NOT #include getopt.h in this file.  The forward
- * declarations below intentionally omit __declspec(dllimport) so that
- * the address-of expressions compile without C2496/C2491.
- */
+          /*
+           * getopt_import_stubs_luasession.c
+           *
+           * Purpose
+           * -------
+           * Ardour's libs/pbd/msvc/getopt.h marks getopt_a and getopt_long_a as
+           * __declspec(dllimport) whenever LIBPBD_DLL is defined without
+           * LIBPBD_DLL_EXPORTS (i.e. in any TU that is NOT part of libpbd itself,
+           * including luasession).  The compiler therefore emits indirect-call code
+           * that dereferences the import-address-table (IAT) pointers:
+           *
+           *   call QWORD PTR [__imp_getopt_long_a]   ; x64 example
+           *
+           * Because luasession compiles getopt sources directly (not through
+           * libpbd.dll), no DLL import library provides those __imp_ symbols, and
+           * the linker reports:
+           *
+           *   LNK2019: unresolved external symbol __imp_getopt_long_a
+           *
+           * Fix
+           * ---
+           * We define __imp_getopt_a and __imp_getopt_long_a here as plain void*
+           * variables initialised with the addresses of our locally compiled
+           * implementations (getopt_luasession.c / getopt_long_luasession.c).
+           * The linker sees these as data symbols, satisfying the IAT-pointer
+           * references, and the indirect calls work correctly at runtime.
+           *
+           * Important: do NOT #include getopt.h in this file.  The forward
+           * declarations below intentionally omit __declspec(dllimport) so that
+           * the address-of expressions compile without C2496/C2491.
+           */
 
-#ifdef _MSC_VER
+          #ifdef _MSC_VER
 
-/* Suppress: non-standard extension – function/data pointer conversion */
-#pragma warning(push)
-#pragma warning(disable: 4054)
-#pragma warning(disable: 4055)
-#pragma warning(disable: 4152)
+          /* Suppress: non-standard extension – function/data pointer conversion */
+          #pragma warning(push)
+          #pragma warning(disable: 4054)
+          #pragma warning(disable: 4055)
+          #pragma warning(disable: 4152)
 
-/*
- * Forward-declare using simplified but link-compatible signatures.
- * The real fourth parameter of getopt_long_a is 'const struct option *';
- * 'const void *' is sufficient here because we only need the function
- * address and want to avoid dragging in the struct option definition.
- */
-extern int getopt_a(int, char *const *, const char *);
-extern int getopt_long_a(int, char *const *, const char *,
-                         const void *, int *);
+          /*
+           * Forward-declare using simplified but link-compatible signatures.
+           * The real fourth parameter of getopt_long_a is 'const struct option *';
+           * 'const void *' is sufficient here because we only need the function
+           * address and want to avoid dragging in the struct option definition.
+           */
+          extern int getopt_a(int, char *const *, const char *);
+          extern int getopt_long_a(int, char *const *, const char *,
+                                   const void *, int *);
 
-/*
- * IAT-pointer symbols the compiler emits references to when it sees
- * __declspec(dllimport) on the two functions above.
- * Initialising them with our static implementations' addresses causes
- * the indirect calls to reach the locally compiled code.
- */
-void *__imp_getopt_a      = (void *)getopt_a;
-void *__imp_getopt_long_a = (void *)getopt_long_a;
+          /*
+           * IAT-pointer symbols the compiler emits references to when it sees
+           * __declspec(dllimport) on the two functions above.
+           * Initialising them with our static implementations' addresses causes
+           * the indirect calls to reach the locally compiled code.
+           */
+          void *__imp_getopt_a      = (void *)getopt_a;
+          void *__imp_getopt_long_a = (void *)getopt_long_a;
 
-#pragma warning(pop)
+          #pragma warning(pop)
 
-#endif /* _MSC_VER */
-'@
+          #endif /* _MSC_VER */
+          '@
 
             Set-Content -Path $stubPath -Value $stubContent -Encoding UTF8
             Write-Host "Created import stub file: $stubPath"
