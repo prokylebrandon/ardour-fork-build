@@ -88,6 +88,14 @@ jobs:
       #
       # We compile the MSVC getopt sources directly into the
       # luasession target so the symbols are available there.
+      #
+      # FIX: upstream defines obj.source as a plain string
+      # (e.g. obj.source = 'luasession.cc'), not a list. The
+      # inserted code must normalize obj.source to a list before
+      # doing += [...], otherwise Python raises:
+      #   TypeError: can only concatenate str (not "list") to str
+      # This normalization is written defensively so it also works
+      # if upstream ever changes obj.source to already be a list.
       # ================================================================
       - name: Patch luasession MSVC getopt
         shell: pwsh
@@ -144,13 +152,20 @@ jobs:
 
           $indent = $Matches['indent']
           $innerIndent = $indent + "    "
+          $innerInnerIndent = $innerIndent + "    "
 
+          # NOTE: obj.source upstream is a STRING, not a list, so we
+          # must normalize it to a list before appending to it.
           $insertion = @(
             "",
             "${indent}if bld.env['build_target'] == 'msvc':",
+            "${innerIndent}if isinstance(obj.source, str):",
+            "${innerInnerIndent}obj.source = obj.source.split()",
+            "${innerIndent}else:",
+            "${innerInnerIndent}obj.source = list(obj.source)",
             "${innerIndent}obj.source += [",
-            "${innerIndent}    '../libs/pbd/msvc/getopt.c',",
-            "${innerIndent}    '../libs/pbd/msvc/getopt_long.c',",
+            "${innerInnerIndent}'../libs/pbd/msvc/getopt.c',",
+            "${innerInnerIndent}'../libs/pbd/msvc/getopt_long.c',",
             "${innerIndent}]"
           )
 
