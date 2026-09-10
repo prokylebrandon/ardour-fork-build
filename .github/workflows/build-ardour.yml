@@ -128,19 +128,23 @@ jobs:
       # Ardour's libpbd contains getopt.c/getopt_long.c for MSVC,
       # but ardour9-lua can still end up with:
       #
-      #   unresolved external symbol __imp_getopt_long_a
+      #   unresolved external symbol __imp_getopt_long
       #
-      # ROOT CAUSE
+      # ROOT CAUSE (verified against this fork's actual source via a
+      # diagnostic dump — an earlier version of this comment invented
+      # "getopt_a"/"getopt_long_a" suffixes that never existed anywhere
+      # in the real getopt.h/getopt.c/getopt_long.c)
       # ----------
-      # getopt.h emits __declspec(dllimport) on getopt_a / getopt_long_a
-      # whenever LIBPBD_DLL is defined without LIBPBD_DLL_EXPORTS (i.e.
-      # in every TU that is not libpbd itself, including luasession).
-      # The compiler therefore generates *indirect* calls through the
-      # IAT pointers __imp_getopt_a / __imp_getopt_long_a rather than
-      # direct calls to the function symbols.  Compiling the getopt .c
-      # sources into luasession provides getopt_long_a as a regular
-      # symbol, but nothing provides the IAT pointer __imp_getopt_long_a,
-      # so the linker fails with LNK2019.
+      # getopt.h marks getopt / getopt_long with GETOPT_API, which
+      # defaults to __declspec(dllimport) unless GETOPT_API is
+      # predefined before the header is included. Any TU that just
+      # #includes getopt.h without predefining it (including
+      # luasession.cc) therefore generates *indirect* calls through
+      # the IAT pointers __imp_getopt / __imp_getopt_long rather than
+      # direct calls. Compiling the getopt .c sources into luasession
+      # provides getopt_long as a regular symbol, but nothing provides
+      # the IAT pointer __imp_getopt_long, so the linker fails with
+      # LNK2019.
       #
       # FIX OVERVIEW
       # ------------
@@ -149,7 +153,7 @@ jobs:
       #   getopt_luasession.c          – private copy of getopt.c
       #   getopt_long_luasession.c     – private copy of getopt_long.c
       #   getopt_import_stubs_luasession.c  ← NEW
-      #       Defines __imp_getopt_a and __imp_getopt_long_a as void*
+      #       Defines __imp_getopt and __imp_getopt_long as void*
       #       variables initialised with the addresses of the two
       #       functions above.  The linker sees these as data symbols and
       #       the compiler-generated indirect calls work correctly at
@@ -193,31 +197,24 @@ jobs:
               Write-Host "Private copy already exists: $dstPath"
             }
 
-            # getopt.h gates the real function bodies behind
-            # LIBPBD_DLL_EXPORTS. luasession compiles with LIBPBD_DLL
-            # defined but not LIBPBD_DLL_EXPORTS, so without this the
-            # private copy's own getopt_a / getopt_long_a bodies never
-            # get emitted, leaving them unresolved at link time even
-            # though the file "compiles" cleanly.
-            $dstContent = Get-Content -Path $dstPath -Raw
-
-            if (-not $dstContent.Contains("#define LIBPBD_DLL_EXPORTS")) {
-              $patched = "#define LIBPBD_DLL_EXPORTS`r`n" + $dstContent
-              Set-Content -Path $dstPath -Value $patched -Encoding UTF8
-              Write-Host "Injected LIBPBD_DLL_EXPORTS into: $dstPath"
-            }
-            else {
-              Write-Host "LIBPBD_DLL_EXPORTS already present in: $dstPath"
-            }
+            # NOTE: an earlier fix attempt injected "#define
+            # LIBPBD_DLL_EXPORTS" here. That macro does not exist
+            # anywhere in this fork's real getopt.c/getopt_long.c —
+            # diagnostic dump confirmed the actual gating macro is
+            # GETOPT_API (__declspec(dllexport) when COMPILER_MSVC
+            # and WAF_BUILD are both defined, which the waf/MSVC
+            # build already provides project-wide). No extra define
+            # is needed here; removed to avoid dead/misleading code.
           }
 
           # ----------------------------------------------------------
           # Step B: create the __imp_ stub file
           #
-          # getopt.h marks getopt_a / getopt_long_a as dllimport in
-          # every TU outside libpbd, so the compiler emits indirect
-          # calls through __imp_getopt_a / __imp_getopt_long_a (IAT
-          # pointers).  We satisfy those linker symbols here by
+          # getopt.h marks getopt / getopt_long as GETOPT_API, which
+          # defaults to dllimport in every TU that doesn't predefine
+          # it (including luasession.cc), so the compiler emits
+          # indirect calls through __imp_getopt / __imp_getopt_long
+          # (IAT pointers). We satisfy those linker symbols here by
           # defining them as void* variables that hold the addresses of
           # our locally compiled implementations.
           #
@@ -235,27 +232,41 @@ jobs:
            *
            * Purpose
            * -------
-           * Ardour's libs/pbd/msvc/getopt.h marks getopt_a and getopt_long_a as
-           * __declspec(dllimport) whenever LIBPBD_DLL is defined without
-           * LIBPBD_DLL_EXPORTS (i.e. in any TU that is NOT part of libpbd itself,
-           * including luasession).  The compiler therefore emits indirect-call code
-           * that dereferences the import-address-table (IAT) pointers:
+           * This fork's libs/pbd/msvc/getopt.h declares the real functions
+           * "getopt" and "getopt_long" (NOT "getopt_a"/"getopt_long_a" -
+           * an earlier version of this patch invented that suffix without
+           * checking the actual source, and those names never existed
+           * anywhere in this codebase, which is why that stub could never
+           * link no matter what macros were set).
            *
-           *   call QWORD PTR [__imp_getopt_long_a]   ; x64 example
+           * getopt.h marks both functions GETOPT_API, which defaults to
+           * __declspec(dllimport) unless GETOPT_API is predefined before
+           * the header is included:
            *
-           * Because luasession compiles getopt sources directly (not through
-           * libpbd.dll), no DLL import library provides those __imp_ symbols, and
-           * the linker reports:
+           *   # if !defined(GETOPT_API)
+           *   #  define GETOPT_API __declspec(dllimport)
+           *   # endif
            *
-           *   LNK2019: unresolved external symbol __imp_getopt_long_a
+           * Any translation unit that includes getopt.h without
+           * predefining GETOPT_API (e.g. luasession.cc) compiles indirect
+           * calls through the import-address-table pointers:
+           *
+           *   call QWORD PTR [__imp_getopt_long]   ; x64 example
+           *
+           * Because luasession compiles getopt.c/getopt_long.c directly
+           * into itself (private copies, not a DLL), no import library
+           * provides those __imp_ symbols, so the linker reports:
+           *
+           *   LNK2019: unresolved external symbol __imp_getopt_long
            *
            * Fix
            * ---
-           * We define __imp_getopt_a and __imp_getopt_long_a here as plain void*
-           * variables initialised with the addresses of our locally compiled
-           * implementations (getopt_luasession.c / getopt_long_luasession.c).
-           * The linker sees these as data symbols, satisfying the IAT-pointer
-           * references, and the indirect calls work correctly at runtime.
+           * Define __imp_getopt and __imp_getopt_long here as plain void*
+           * variables initialised with the addresses of the real getopt/
+           * getopt_long implementations compiled into getopt_luasession.c
+           * and getopt_long_luasession.c. The linker sees these as data
+           * symbols, satisfying the IAT-pointer references, and the
+           * indirect calls reach the locally compiled code at runtime.
            *
            * Important: do NOT #include getopt.h in this file.  The forward
            * declarations below intentionally omit __declspec(dllimport) so that
@@ -272,13 +283,13 @@ jobs:
 
           /*
            * Forward-declare using simplified but link-compatible signatures.
-           * The real fourth parameter of getopt_long_a is 'const struct option *';
+           * The real fourth parameter of getopt_long is 'const struct option *';
            * 'const void *' is sufficient here because we only need the function
            * address and want to avoid dragging in the struct option definition.
            */
-          extern int getopt_a(int, char *const *, const char *);
-          extern int getopt_long_a(int, char *const *, const char *,
-                                   const void *, int *);
+          extern int getopt(int, char *const *, const char *);
+          extern int getopt_long(int, char *const *, const char *,
+                                 const void *, int *);
 
           /*
            * IAT-pointer symbols the compiler emits references to when it sees
@@ -286,8 +297,8 @@ jobs:
            * Initialising them with our static implementations' addresses causes
            * the indirect calls to reach the locally compiled code.
            */
-          void *__imp_getopt_a      = (void *)getopt_a;
-          void *__imp_getopt_long_a = (void *)getopt_long_a;
+          void *__imp_getopt      = (void *)getopt;
+          void *__imp_getopt_long = (void *)getopt_long;
 
           #pragma warning(pop)
 
@@ -363,8 +374,8 @@ jobs:
           # must normalise it to a list before appending to it.
           #
           # Three files are added:
-          #   getopt_luasession.c               – implements getopt_a
-          #   getopt_long_luasession.c          – implements getopt_long_a
+          #   getopt_luasession.c               – implements getopt
+          #   getopt_long_luasession.c          – implements getopt_long
           #   getopt_import_stubs_luasession.c  – provides __imp_ IAT ptrs
           $insertion = @(
             "",
