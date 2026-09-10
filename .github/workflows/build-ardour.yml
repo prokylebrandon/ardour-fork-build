@@ -86,30 +86,37 @@ jobs:
       #
       #   unresolved external symbol __imp_getopt_long_a
       #
-      # We compile the MSVC getopt sources directly into the
-      # luasession target so the symbols are available there.
+      # ROOT CAUSE
+      # ----------
+      # getopt.h emits __declspec(dllimport) on getopt_a / getopt_long_a
+      # whenever LIBPBD_DLL is defined without LIBPBD_DLL_EXPORTS (i.e.
+      # in every TU that is not libpbd itself, including luasession).
+      # The compiler therefore generates *indirect* calls through the
+      # IAT pointers __imp_getopt_a / __imp_getopt_long_a rather than
+      # direct calls to the function symbols.  Compiling the getopt .c
+      # sources into luasession provides getopt_long_a as a regular
+      # symbol, but nothing provides the IAT pointer __imp_getopt_long_a,
+      # so the linker fails with LNK2019.
       #
-      # FIX #1: upstream defines obj.source as a plain string
-      # (e.g. obj.source = 'luasession.cc'), not a list. The
-      # inserted code must normalize obj.source to a list before
-      # doing += [...], otherwise Python raises:
-      #   TypeError: can only concatenate str (not "list") to str
-      # This normalization is written defensively so it also works
-      # if upstream ever changes obj.source to already be a list.
+      # FIX OVERVIEW
+      # ------------
+      # Three private source files are compiled directly into luasession:
       #
-      # FIX #2: libpbd's own build already compiles the ORIGINAL
-      # getopt.c/getopt_long.c from this directory. If luasession
-      # compiles those same two source files directly, both task
-      # generators can end up writing to the identical output
-      # object path under build\, and under parallel jobs two
-      # cl.exe processes race to create that same file:
-      #   fatal error C1083: Cannot open compiler generated file:
-      #   '...\getopt_long.c.1.o': Permission denied
-      # To guarantee luasession never shares an output path with
-      # libpbd's own compile, we give luasession private,
-      # uniquely-named copies of the two sources (kept in the same
-      # directory, so any local #include "getopt.h" style includes
-      # keep resolving correctly).
+      #   getopt_luasession.c          – private copy of getopt.c
+      #   getopt_long_luasession.c     – private copy of getopt_long.c
+      #   getopt_import_stubs_luasession.c  ← NEW
+      #       Defines __imp_getopt_a and __imp_getopt_long_a as void*
+      #       variables initialised with the addresses of the two
+      #       functions above.  The linker sees these as data symbols and
+      #       the compiler-generated indirect calls work correctly at
+      #       runtime.
+      #
+      # FIX #1 (unchanged): private copies of the source files guarantee
+      # luasession never shares an output .obj path with libpbd's own
+      # compile of those same files under parallel jobs.
+      #
+      # FIX #2 (unchanged): obj.source is normalised from str to list
+      # before appending so Python does not raise TypeError.
       # ================================================================
       - name: Patch luasession MSVC getopt
         shell: pwsh
@@ -118,6 +125,9 @@ jobs:
 
           $msvcDir = "libs\pbd\msvc"
 
+          # ----------------------------------------------------------
+          # Step A: private copies of the two getopt source files
+          # ----------------------------------------------------------
           $copies = @(
             @{ Src = "getopt.c";      Dst = "getopt_luasession.c" },
             @{ Src = "getopt_long.c"; Dst = "getopt_long_luasession.c" }
@@ -140,16 +150,112 @@ jobs:
             }
           }
 
+          # ----------------------------------------------------------
+          # Step B: create the __imp_ stub file
+          #
+          # getopt.h marks getopt_a / getopt_long_a as dllimport in
+          # every TU outside libpbd, so the compiler emits indirect
+          # calls through __imp_getopt_a / __imp_getopt_long_a (IAT
+          # pointers).  We satisfy those linker symbols here by
+          # defining them as void* variables that hold the addresses of
+          # our locally compiled implementations.
+          #
+          # DO NOT include getopt.h in this file – the forward
+          # declarations below intentionally omit __declspec(dllimport)
+          # so that taking the function's address compiles without
+          # C2496 / C2491.
+          # ----------------------------------------------------------
+          $stubPath = Join-Path $msvcDir "getopt_import_stubs_luasession.c"
+
+          if (-not (Test-Path $stubPath)) {
+            $stubContent = @'
+*
+ * getopt_import_stubs_luasession.c
+ *
+ * Purpose
+ * -------
+ * Ardour's libs/pbd/msvc/getopt.h marks getopt_a and getopt_long_a as
+ * __declspec(dllimport) whenever LIBPBD_DLL is defined without
+ * LIBPBD_DLL_EXPORTS (i.e. in any TU that is NOT part of libpbd itself,
+ * including luasession).  The compiler therefore emits indirect-call code
+ * that dereferences the import-address-table (IAT) pointers:
+ *
+ *   call QWORD PTR [__imp_getopt_long_a]   ; x64 example
+ *
+ * Because luasession compiles getopt sources directly (not through
+ * libpbd.dll), no DLL import library provides those __imp_ symbols, and
+ * the linker reports:
+ *
+ *   LNK2019: unresolved external symbol __imp_getopt_long_a
+ *
+ * Fix
+ * ---
+ * We define __imp_getopt_a and __imp_getopt_long_a here as plain void*
+ * variables initialised with the addresses of our locally compiled
+ * implementations (getopt_luasession.c / getopt_long_luasession.c).
+ * The linker sees these as data symbols, satisfying the IAT-pointer
+ * references, and the indirect calls work correctly at runtime.
+ *
+ * Important: do NOT #include getopt.h in this file.  The forward
+ * declarations below intentionally omit __declspec(dllimport) so that
+ * the address-of expressions compile without C2496/C2491.
+ */
+
+#ifdef _MSC_VER
+
+/* Suppress: non-standard extension – function/data pointer conversion */
+#pragma warning(push)
+#pragma warning(disable: 4054)
+#pragma warning(disable: 4055)
+#pragma warning(disable: 4152)
+
+/*
+ * Forward-declare using simplified but link-compatible signatures.
+ * The real fourth parameter of getopt_long_a is 'const struct option *';
+ * 'const void *' is sufficient here because we only need the function
+ * address and want to avoid dragging in the struct option definition.
+ */
+extern int getopt_a(int, char *const *, const char *);
+extern int getopt_long_a(int, char *const *, const char *,
+                         const void *, int *);
+
+/*
+ * IAT-pointer symbols the compiler emits references to when it sees
+ * __declspec(dllimport) on the two functions above.
+ * Initialising them with our static implementations' addresses causes
+ * the indirect calls to reach the locally compiled code.
+ */
+void *__imp_getopt_a      = (void *)getopt_a;
+void *__imp_getopt_long_a = (void *)getopt_long_a;
+
+#pragma warning(pop)
+
+#endif /* _MSC_VER */
+'@
+
+            Set-Content -Path $stubPath -Value $stubContent -Encoding UTF8
+            Write-Host "Created import stub file: $stubPath"
+          }
+          else {
+            Write-Host "Import stub file already exists: $stubPath"
+          }
+
+          # ----------------------------------------------------------
+          # Step C: patch luasession/wscript
+          # ----------------------------------------------------------
           $file = "luasession\wscript"
 
           if (-not (Test-Path $file)) {
             throw "$file was not found."
           }
 
-          # Already patched (e.g. re-run on a reused workspace)? Nothing to do.
+          # Idempotency: keyed on the stub file name (new, unique string).
+          # If only the old patch (without stubs) is present this check
+          # will not match, causing the wscript to be re-patched with the
+          # complete set of three source files.
           $existing = Get-Content $file -Raw
 
-          if ($existing.Contains("../libs/pbd/msvc/getopt_long_luasession.c")) {
+          if ($existing.Contains("../libs/pbd/msvc/getopt_import_stubs_luasession.c")) {
             Write-Host "luasession getopt patch already exists. Skipping."
             exit 0
           }
@@ -193,11 +299,12 @@ jobs:
           $innerInnerIndent = $innerIndent + "    "
 
           # NOTE: obj.source upstream is a STRING, not a list, so we
-          # must normalize it to a list before appending to it. We
-          # reference our OWN private copies of getopt.c/getopt_long.c
-          # (created above) rather than the originals, so this never
-          # shares an output object path with libpbd's own compile of
-          # the originals.
+          # must normalise it to a list before appending to it.
+          #
+          # Three files are added:
+          #   getopt_luasession.c               – implements getopt_a
+          #   getopt_long_luasession.c          – implements getopt_long_a
+          #   getopt_import_stubs_luasession.c  – provides __imp_ IAT ptrs
           $insertion = @(
             "",
             "${indent}if bld.env['build_target'] == 'msvc':",
@@ -208,6 +315,7 @@ jobs:
             "${innerIndent}obj.source += [",
             "${innerInnerIndent}'../libs/pbd/msvc/getopt_luasession.c',",
             "${innerInnerIndent}'../libs/pbd/msvc/getopt_long_luasession.c',",
+            "${innerInnerIndent}'../libs/pbd/msvc/getopt_import_stubs_luasession.c',",
             "${innerIndent}]"
           )
 
@@ -220,7 +328,7 @@ jobs:
 
           Set-Content -Path $file -Value $newLines -Encoding UTF8
 
-          Write-Host "Added private MSVC getopt copies to luasession."
+          Write-Host "Added private MSVC getopt copies + IAT import stubs to luasession."
           Write-Host ""
           Write-Host "Resulting section:"
           Get-Content $file |
