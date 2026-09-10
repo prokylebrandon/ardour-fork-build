@@ -148,6 +148,23 @@ jobs:
             else {
               Write-Host "Private copy already exists: $dstPath"
             }
+
+            # getopt.h gates the real function bodies behind
+            # LIBPBD_DLL_EXPORTS. luasession compiles with LIBPBD_DLL
+            # defined but not LIBPBD_DLL_EXPORTS, so without this the
+            # private copy's own getopt_a / getopt_long_a bodies never
+            # get emitted, leaving them unresolved at link time even
+            # though the file "compiles" cleanly.
+            $dstContent = Get-Content -Path $dstPath -Raw
+
+            if (-not $dstContent.Contains("#define LIBPBD_DLL_EXPORTS")) {
+              $patched = "#define LIBPBD_DLL_EXPORTS`r`n" + $dstContent
+              Set-Content -Path $dstPath -Value $patched -Encoding UTF8
+              Write-Host "Injected LIBPBD_DLL_EXPORTS into: $dstPath"
+            }
+            else {
+              Write-Host "LIBPBD_DLL_EXPORTS already present in: $dstPath"
+            }
           }
 
           # ----------------------------------------------------------
