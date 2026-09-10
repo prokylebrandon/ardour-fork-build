@@ -80,11 +80,6 @@ jobs:
 
       # ================================================================
       # 2B. DIAGNOSTIC: DUMP REAL GETOPT SOURCES
-      #
-      # Prior fix attempts guessed at macro gating (LIBPBD_DLL_EXPORTS)
-      # without ever seeing this fork's actual getopt.h / getopt.c /
-      # getopt_long.c. Dump them so the next failure is diagnosed from
-      # real source instead of another guess.
       # ================================================================
       - name: Dump getopt sources for diagnosis
         shell: pwsh
@@ -94,7 +89,8 @@ jobs:
           $files = @(
             "libs\pbd\msvc\getopt.h",
             "libs\pbd\msvc\getopt.c",
-            "libs\pbd\msvc\getopt_long.c"
+            "libs\pbd\msvc\getopt_long.c",
+            "libs\pbd\msvc_pbd.h"
           )
 
           foreach ($f in $files) {
@@ -108,7 +104,9 @@ jobs:
               continue
             }
 
-            Get-Content $f | ForEach-Object { Write-Host $_ }
+            Get-Content $f | ForEach-Object {
+              Write-Host $_
+            }
           }
 
           Write-Host ""
@@ -120,72 +118,33 @@ jobs:
             -Path $files `
             -Pattern "getopt_a|getopt_long_a|LIBPBD_DLL|GETOPT_API|dllimport|dllexport" `
             -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            ForEach-Object {
+              Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())"
+            }
 
       # ================================================================
       # 3. PATCH LUASESSION MSVC GETOPT LINKING
       #
-      # Ardour's libpbd contains getopt.c/getopt_long.c for MSVC,
-      # but ardour9-lua can still end up failing to link.
+      # The observed linker error is:
       #
-      # ROOT CAUSE, UPDATED WITH GROUND-TRUTH LINKER EVIDENCE
-      # -------------------------------------------------------
-      # The actual failure observed was:
+      #   unresolved external symbol __imp_getopt_long_a
       #
-      #   luasession.cc.1.o : error LNK2019: unresolved external
-      #   symbol __imp_getopt_long_a referenced in function main
+      # This means luasession is compiling getopt_long() as a DLL-imported
+      # symbol instead of directly linking against the local implementation.
       #
-      # NOT __imp_getopt_long. That symbol name comes straight from
-      # the linker, not a guess, and it proves two things at once:
+      # Fix:
       #
-      #   1. getopt.h macro-renames getopt_long to an underlying,
-      #      suffixed name (getopt_long_a) in every translation unit
-      #      that includes it -- consistent with a TCHAR-style
-      #      ANSI/Unicode generic-text mapping.
-      #   2. GETOPT_API on that declaration still defaults to
-      #      __declspec(dllimport) for luasession.cc, so the compiler
-      #      emits an *indirect* call through an IAT pointer
-      #      (__imp_getopt_long_a) instead of a direct call.
+      #   A. Create private getopt source copies for luasession.
       #
-      # A previous fix attempt tried to satisfy this by hand-writing a
-      # separate getopt_import_stubs_luasession.c file that manually
-      # defined __imp_getopt / __imp_getopt_long as void* IAT
-      # pointers. That file deliberately avoided including getopt.h
-      # (to dodge the dllimport declaration) and instead forward-
-      # declared the plain, non-suffixed names itself. Because it
-      # never went through getopt.h's macro renaming, it defined
-      # pointers under names the linker was never actually asking
-      # for (__imp_getopt_long) instead of the real one
-      # (__imp_getopt_long_a) -- it required guessing the exact
-      # suffixed name up front, and guessed wrong.
+      #   B. Remove DLL export decoration from those private copies.
       #
-      # FIX OVERVIEW (this revision)
-      # -----------------------------
-      # Drop the hand-written stub file entirely. Instead, predefine
-      # GETOPT_API as empty on the command line for the whole
-      # luasession task generator:
+      #   C. Define GETOPT_API directly in luasession.cc before headers
+      #      are processed, preventing getopt.h from defining it as
+      #      __declspec(dllimport).
       #
-      #   obj.defines += ['GETOPT_API=']
+      #   D. Add the private getopt sources to luasession/wscript.
       #
-      # This is a compiler define, not a macro guess about symbol
-      # suffixes. luasession.cc and both private getopt copies below
-      # all `#include` the same getopt.h, so the ANSI/Unicode rename
-      # applies identically and automatically to every declaration
-      # AND every call site across all three files -- whatever the
-      # real underlying suffixed name is. With GETOPT_API now empty
-      # instead of __declspec(dllimport), the compiler emits ordinary
-      # *direct* calls to that name, and the private copies (Step A)
-      # already compile that exact symbol as a normal, non-imported
-      # external. It links with no stub file and no hardcoded suffix
-      # guess required.
-      #
-      # FIX #1 (unchanged): private copies of the source files guarantee
-      # luasession never shares an output .obj path with libpbd's own
-      # compile of those same files under parallel jobs.
-      #
-      # FIX #2 (unchanged): obj.source (and now obj.defines) are
-      # normalised to a list before appending so Python does not
-      # raise TypeError regardless of upstream's current type.
+      # We deliberately DO NOT use the previous obj.defines approach.
       # ================================================================
       - name: Patch luasession MSVC getopt
         shell: pwsh
@@ -194,154 +153,267 @@ jobs:
 
           $msvcDir = "libs\pbd\msvc"
 
-          # ----------------------------------------------------------
-          # Step A: private copies of the two getopt source files
-          #
-          # Guarantees luasession never shares an output .obj path
-          # with libpbd's own compile of getopt.c / getopt_long.c
-          # under parallel (-j) waf jobs.
-          # ----------------------------------------------------------
+          if (!(Test-Path $msvcDir)) {
+            throw "MSVC getopt directory not found: $msvcDir"
+          }
+
+          # ------------------------------------------------------------
+          # A. Create private getopt sources for luasession
+          # ------------------------------------------------------------
+
           $copies = @(
-            @{ Src = "getopt.c";      Dst = "getopt_luasession.c" },
-            @{ Src = "getopt_long.c"; Dst = "getopt_long_luasession.c" }
+            @{
+              Src = "getopt.c"
+              Dst = "getopt_luasession.c"
+            },
+            @{
+              Src = "getopt_long.c"
+              Dst = "getopt_long_luasession.c"
+            }
           )
 
           foreach ($copy in $copies) {
-            $srcPath = Join-Path $msvcDir $copy.Src
-            $dstPath = Join-Path $msvcDir $copy.Dst
 
-            if (-not (Test-Path $srcPath)) {
-              throw "$srcPath was not found; cannot create private copy for luasession."
+            $src = Join-Path $msvcDir $copy.Src
+            $dst = Join-Path $msvcDir $copy.Dst
+
+            if (!(Test-Path $src)) {
+              throw "Missing source file: $src"
             }
 
-            if (-not (Test-Path $dstPath)) {
-              Copy-Item -Path $srcPath -Destination $dstPath
-              Write-Host "Created private copy: $dstPath"
-            }
-            else {
-              Write-Host "Private copy already exists: $dstPath"
-            }
+            Copy-Item `
+              -Path $src `
+              -Destination $dst `
+              -Force
+
+            Write-Host "Created private getopt source:"
+            Write-Host "  $dst"
           }
 
-          # ----------------------------------------------------------
-          # Step B: patch luasession/wscript
+          # ------------------------------------------------------------
+          # B. Patch the private getopt implementations
           #
-          # Two things get added to the luasession task generator:
-          #
-          #   1. obj.source += the two private getopt copies from
-          #      Step A, so their implementations are compiled
-          #      directly into ardour9-lua.exe.
-          #
-          #   2. obj.defines += 'GETOPT_API=', applied to every file
-          #      in this task generator (luasession.cc AND the two
-          #      private copies), predefining GETOPT_API as empty so
-          #      getopt.h never falls back to __declspec(dllimport).
-          #      See the FIX OVERVIEW comment above this step for why
-          #      this replaces the old hand-written __imp_ stub file.
-          # ----------------------------------------------------------
-          $file = "luasession\wscript"
+          # These files are linked directly into ardour9-lua.exe.
+          # They must therefore not export their symbols as DLL APIs.
+          # ------------------------------------------------------------
 
-          if (-not (Test-Path $file)) {
-            throw "$file was not found."
-          }
-
-          # Idempotency: keyed on the obj.defines marker this patch
-          # introduces. If only an older patch revision (stub-file
-          # based, or no defines at all) is present, this check will
-          # not match, causing the wscript to be re-patched with the
-          # current source list + defines.
-          $existing = Get-Content $file -Raw
-
-          if ($existing.Contains("obj.defines += ['GETOPT_API=']")) {
-            Write-Host "luasession getopt patch already exists. Skipping."
-            exit 0
-          }
-
-          $lines = Get-Content $file
-
-          # Match the source line tolerant of whitespace/quote style, instead
-          # of relying on one exact literal string that upstream formatting
-          # changes can silently break.
-          #   obj.source       = 'luasession.cc'
-          #   obj.source = "luasession.cc"
-          $pattern = "^(?<indent>\s*)obj\.source\s*=\s*['""]luasession\.cc['""]\s*$"
-
-          $matchIndex = -1
-
-          for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match $pattern) {
-              $matchIndex = $i
-              break
-            }
-          }
-
-          if ($matchIndex -eq -1) {
-            Write-Host ""
-            Write-Host "=========================================================="
-            Write-Host "Could not find the expected luasession source line."
-            Write-Host "Showing full file for diagnosis:"
-            Write-Host "=========================================================="
-            Get-Content $file | ForEach-Object { Write-Host $_ }
-
-            throw (
-              "Could not find expected luasession source marker " +
-              "(obj.source = 'luasession.cc'). " +
-              "Upstream luasession/wscript may have changed format; " +
-              "see file dump above and update the patch step."
-            )
-          }
-
-          $indent = $Matches['indent']
-          $innerIndent = $indent + "    "
-          $innerInnerIndent = $innerIndent + "    "
-
-          # NOTE: obj.source upstream is a STRING, not a list, so we
-          # must normalise it to a list before appending to it.
-          # obj.defines may not exist at all on this task generator,
-          # so it is normalised the same defensive way.
-          #
-          # Two source files are added:
-          #   getopt_luasession.c       – implements getopt/getopt_a
-          #   getopt_long_luasession.c  – implements getopt_long/getopt_long_a
-          #
-          # One define is added:
-          #   GETOPT_API=  – predefines GETOPT_API empty so getopt.h
-          #                  never falls back to dllimport for this
-          #                  task generator's files.
-          $insertion = @(
-            "",
-            "${indent}if bld.env['build_target'] == 'msvc':",
-            "${innerIndent}if isinstance(obj.source, str):",
-            "${innerInnerIndent}obj.source = obj.source.split()",
-            "${innerIndent}else:",
-            "${innerInnerIndent}obj.source = list(obj.source)",
-            "${innerIndent}obj.source += [",
-            "${innerInnerIndent}'../libs/pbd/msvc/getopt_luasession.c',",
-            "${innerInnerIndent}'../libs/pbd/msvc/getopt_long_luasession.c',",
-            "${innerIndent}]",
-            "${innerIndent}if not hasattr(obj, 'defines') or obj.defines is None:",
-            "${innerInnerIndent}obj.defines = []",
-            "${innerIndent}elif isinstance(obj.defines, str):",
-            "${innerInnerIndent}obj.defines = obj.defines.split()",
-            "${innerIndent}else:",
-            "${innerInnerIndent}obj.defines = list(obj.defines)",
-            "${innerIndent}obj.defines += ['GETOPT_API=']"
+          $privateSources = @(
+            "$msvcDir\getopt_luasession.c",
+            "$msvcDir\getopt_long_luasession.c"
           )
 
-          $newLines = @()
-          $newLines += $lines[0..$matchIndex]
-          $newLines += $insertion
-          if ($matchIndex + 1 -lt $lines.Count) {
-            $newLines += $lines[($matchIndex + 1)..($lines.Count - 1)]
+          foreach ($file in $privateSources) {
+
+            $text = Get-Content `
+              -Path $file `
+              -Raw
+
+            # Remove the WAF_BUILD DLL export.
+            $text = $text.Replace(
+              '#define GETOPT_API __declspec(dllexport)',
+              '#define GETOPT_API'
+            )
+
+            # Make absolutely sure GETOPT_API exists before getopt.h.
+            if ($text -notmatch '(?m)^#define GETOPT_API\s*$') {
+
+              $text = @"
+          #ifndef GETOPT_API
+          #define GETOPT_API
+          #endif
+
+          $text
+          "@
+            }
+
+            Set-Content `
+              -Path $file `
+              -Value $text `
+              -Encoding UTF8
+
+            Write-Host "Patched private getopt source:"
+            Write-Host "  $file"
           }
 
-          Set-Content -Path $file -Value $newLines -Encoding UTF8
+          # ------------------------------------------------------------
+          # C. Patch luasession.cc
+          #
+          # THIS IS THE IMPORTANT PART.
+          #
+          # getopt.h contains:
+          #
+          #   #define GETOPT_API __declspec(dllimport)
+          #
+          # when GETOPT_API has not already been defined.
+          #
+          # Defining GETOPT_API here prevents that import declaration
+          # from being generated.
+          # ------------------------------------------------------------
 
-          Write-Host "Added private MSVC getopt copies + GETOPT_API=empty define to luasession."
+          $luaFile = "luasession\luasession.cc"
+
+          if (!(Test-Path $luaFile)) {
+            throw "Missing luasession source: $luaFile"
+          }
+
+          $luaText = Get-Content `
+            -Path $luaFile `
+            -Raw
+
+          if ($luaText -notmatch "ARDOUR_MSVC_GETOPT_LOCAL") {
+
+            $prefix = @"
+          /*
+           * Ardour MSVC build:
+           *
+           * luasession uses the local MSVC getopt implementation.
+           * Do not mark getopt symbols as DLL imports.
+           */
+          #if defined(COMPILER_MSVC) && defined(WAF_BUILD)
+          #ifndef GETOPT_API
+          #define GETOPT_API
+          #endif
+          #define ARDOUR_MSVC_GETOPT_LOCAL
+          #endif
+
+          "@
+
+            $luaText = $prefix + $luaText
+
+            Set-Content `
+              -Path $luaFile `
+              -Value $luaText `
+              -Encoding UTF8
+
+            Write-Host "Patched luasession.cc."
+          }
+          else {
+            Write-Host "luasession.cc already contains the MSVC getopt patch."
+          }
+
+          # ------------------------------------------------------------
+          # D. Patch luasession/wscript
+          # ------------------------------------------------------------
+
+          $wscript = "luasession\wscript"
+
+          if (!(Test-Path $wscript)) {
+            throw "Missing file: $wscript"
+          }
+
+          $lines = Get-Content $wscript
+
+          # Prevent duplicate insertion.
+          if ($lines -match "getopt_luasession\.c") {
+            Write-Host "luasession/wscript getopt patch already exists."
+          }
+          else {
+
+            $pattern = '^(?<indent>\s*)obj\.source\s*=\s*[''"]luasession\.cc[''"]\s*$'
+
+            $matchIndex = -1
+            $indent = ""
+
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+
+              if ($lines[$i] -match $pattern) {
+                $matchIndex = $i
+                $indent = $Matches["indent"]
+                break
+              }
+            }
+
+            if ($matchIndex -eq -1) {
+
+              Write-Host ""
+              Write-Host "=========================================================="
+              Write-Host "luasession/wscript contents:"
+              Write-Host "=========================================================="
+
+              $lines | ForEach-Object {
+                Write-Host $_
+              }
+
+              throw "Could not locate obj.source = 'luasession.cc'."
+            }
+
+            $inner = $indent + "    "
+            $inner2 = $inner + "    "
+
+            $insertion = @(
+              "",
+              "${indent}if bld.env['build_target'] == 'msvc':",
+              "${inner}if isinstance(obj.source, str):",
+              "${inner2}obj.source = obj.source.split()",
+              "${inner}else:",
+              "${inner2}obj.source = list(obj.source)",
+              "${inner}obj.source += [",
+              "${inner2}'../libs/pbd/msvc/getopt_luasession.c',",
+              "${inner2}'../libs/pbd/msvc/getopt_long_luasession.c',",
+              "${inner}]"
+            )
+
+            $newLines = @()
+
+            if ($matchIndex -ge 0) {
+              $newLines += $lines[0..$matchIndex]
+            }
+
+            $newLines += $insertion
+
+            if ($matchIndex + 1 -lt $lines.Count) {
+              $newLines += $lines[($matchIndex + 1)..($lines.Count - 1)]
+            }
+
+            Set-Content `
+              -Path $wscript `
+              -Value $newLines `
+              -Encoding UTF8
+
+            Write-Host "Patched luasession/wscript."
+          }
+
+          # ------------------------------------------------------------
+          # E. Print final state
+          # ------------------------------------------------------------
+
           Write-Host ""
-          Write-Host "Resulting section:"
-          Get-Content $file |
-            Select-String -Pattern "getopt|obj.source|obj.defines" -Context 2,2
+          Write-Host "=========================================================="
+          Write-Host "VERIFYING LUASESSION GETOPT PATCH"
+          Write-Host "=========================================================="
+
+          Write-Host ""
+          Write-Host "--- luasession.cc ---"
+
+          Get-Content "luasession\luasession.cc" |
+            Select-String `
+              -Pattern "ARDOUR_MSVC_GETOPT_LOCAL|GETOPT_API" `
+              -Context 2,3
+
+          Write-Host ""
+          Write-Host "--- luasession/wscript ---"
+
+          Get-Content "luasession\wscript" |
+            Select-String `
+              -Pattern "luasession\.cc|getopt_luasession|getopt_long_luasession" `
+              -Context 2,4
+
+          Write-Host ""
+          Write-Host "--- private getopt files ---"
+
+          foreach ($file in $privateSources) {
+            Write-Host ""
+            Write-Host $file
+
+            Select-String `
+              -Path $file `
+              -Pattern "GETOPT_API|dllexport|dllimport" `
+              -Context 1,1 `
+              -ErrorAction SilentlyContinue
+          }
+
+          Write-Host ""
+          Write-Host "MSVC luasession getopt patch completed."
 
       # ================================================================
       # 4. TOOLCHAIN
@@ -393,8 +465,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Visual Studio may set VCPKG_ROOT to its own bundled copy.
-          # We deliberately do not use that variable.
           Remove-Item Env:VCPKG_ROOT -ErrorAction SilentlyContinue
 
           $vcpkg = $env:VCPKG_HOME
@@ -618,7 +688,6 @@ jobs:
 
           [void]$includeDirs.Add("$installed\include")
 
-          # Query pkg-config for package-specific include directories.
           $packages = @(
             "glib-2.0",
             "gobject-2.0",
@@ -672,7 +741,6 @@ jobs:
               if ($token.StartsWith("-I")) {
 
                 $path = $token.Substring(2).Trim('"')
-
                 $path = $path -replace '/', '\'
 
                 if ($path.Length -gt 0) {
@@ -682,17 +750,12 @@ jobs:
             }
           }
 
-          # Explicit known include locations for Windows/vcpkg layouts.
           $knownDirectories = @(
             "$installed\include",
             "$installed\include\glib-2.0",
             "$installed\lib\glib-2.0\include",
             "$installed\include\libxml2",
-
-            # FIX:
-            # vcpkg/libusb places libusb.h under include\libusb-1.0.
             "$installed\include\libusb-1.0",
-
             "$installed\include\pthread",
             "$installed\include\sigc++-2.0",
             "$installed\include\glibmm-2.66",
@@ -870,10 +933,6 @@ jobs:
 
       # ================================================================
       # 15. CLEAN PREVIOUS WAF BUILD STATE
-      #
-      # Ensures a fully clean configure/build on every run. Slower than
-      # an incremental build, but avoids stale Waf/MSVC configuration
-      # left over from a prior cache restore or reused workspace.
       # ================================================================
       - name: Clean Waf build state
         shell: pwsh
@@ -881,11 +940,17 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if (Test-Path ".waf3") {
-            Remove-Item -Recurse -Force ".waf3"
+            Remove-Item `
+              -Recurse `
+              -Force `
+              ".waf3"
           }
 
           if (Test-Path "build") {
-            Remove-Item -Recurse -Force "build"
+            Remove-Item `
+              -Recurse `
+              -Force `
+              "build"
           }
 
           Write-Host "Waf build state cleaned."
@@ -973,6 +1038,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           python waf install
 
       # ================================================================
