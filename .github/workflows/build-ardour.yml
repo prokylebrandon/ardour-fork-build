@@ -94,7 +94,8 @@ jobs:
           $files = @(
             "libs\pbd\msvc\getopt.h",
             "libs\pbd\msvc\getopt.c",
-            "libs\pbd\msvc\getopt_long.c"
+            "libs\pbd\msvc\getopt_long.c",
+            "libs\pbd\pbd\msvc_pbd.h"
           )
 
           foreach ($f in $files) {
@@ -194,22 +195,16 @@ jobs:
       #
       #   unresolved external symbol __imp_getopt_long_a
       #
-      # This means luasession is compiling getopt_long() as a DLL-imported
-      # symbol instead of directly linking against the local implementation.
+      # The repository does not contain an actual getopt_long_a symbol.
+      # Ardour provides its own getopt implementation under:
       #
-      # Fix:
+      #   libs/pbd/msvc/getopt.h
+      #   libs/pbd/msvc/getopt.c
+      #   libs/pbd/msvc/getopt_long.c
       #
-      #   A. Create private getopt source copies for luasession.
-      #
-      #   B. Remove DLL export decoration from those private copies.
-      #
-      #   C. Define GETOPT_API directly in luasession.cc before headers
-      #      are processed, preventing getopt.h from defining it as
-      #      __declspec(dllimport).
-      #
-      #   D. Add the private getopt sources to luasession/wscript.
-      #
-      # We deliberately DO NOT use the previous obj.defines approach.
+      # The fix forces luasession to use Ardour's own MSVC getopt header
+      # and links private local copies of the implementation directly
+      # into the luasession executable.
       # ================================================================
       - name: Patch luasession MSVC getopt
         shell: pwsh
@@ -279,7 +274,8 @@ jobs:
               '#define GETOPT_API'
             )
 
-            # Make absolutely sure GETOPT_API exists before getopt.h.
+            # Make absolutely sure GETOPT_API exists before any
+            # Ardour getopt headers are included.
             if ($text -notmatch '(?m)^#define GETOPT_API\s*$') {
 
               $text = @"
@@ -303,16 +299,19 @@ jobs:
           # ------------------------------------------------------------
           # C. Patch luasession.cc
           #
-          # THIS IS THE IMPORTANT PART.
+          # IMPORTANT:
           #
-          # getopt.h contains:
+          # Do not allow:
           #
-          #   #define GETOPT_API __declspec(dllimport)
+          #   #include <getopt.h>
           #
-          # when GETOPT_API has not already been defined.
+          # to resolve to an unrelated Windows/vcpkg getopt header.
           #
-          # Defining GETOPT_API here prevents that import declaration
-          # from being generated.
+          # Explicitly use:
+          #
+          #   pbd/msvc/getopt.h
+          #
+          # for the MSVC Waf build.
           # ------------------------------------------------------------
 
           $luaFile = "luasession\luasession.cc"
@@ -324,6 +323,41 @@ jobs:
           $luaText = Get-Content `
             -Path $luaFile `
             -Raw
+
+          # ------------------------------------------------------------
+          # C1. Force Ardour's own getopt header
+          # ------------------------------------------------------------
+
+          $oldInclude = '#include <getopt.h>'
+
+          $newInclude = @"
+          #if defined(COMPILER_MSVC) && defined(WAF_BUILD)
+          #include "pbd/msvc/getopt.h"
+          #else
+          #include <getopt.h>
+          #endif
+          "@
+
+          if ($luaText.Contains($oldInclude)) {
+
+            $luaText = $luaText.Replace(
+              $oldInclude,
+              $newInclude.Trim()
+            )
+
+            Write-Host "Patched luasession.cc getopt include."
+          }
+          elseif ($luaText -notmatch 'pbd/msvc/getopt\.h') {
+
+            throw "Could not locate the getopt include in luasession.cc."
+          }
+          else {
+            Write-Host "luasession.cc already uses Ardour's MSVC getopt header."
+          }
+
+          # ------------------------------------------------------------
+          # C2. Prevent GETOPT_API from becoming dllimport
+          # ------------------------------------------------------------
 
           if ($luaText -notmatch "ARDOUR_MSVC_GETOPT_LOCAL") {
 
@@ -345,16 +379,18 @@ jobs:
 
             $luaText = $prefix + $luaText
 
-            Set-Content `
-              -Path $luaFile `
-              -Value $luaText `
-              -Encoding UTF8
-
-            Write-Host "Patched luasession.cc."
+            Write-Host "Added local GETOPT_API override."
           }
           else {
-            Write-Host "luasession.cc already contains the MSVC getopt patch."
+            Write-Host "luasession.cc already contains the local GETOPT_API override."
           }
+
+          Set-Content `
+            -Path $luaFile `
+            -Value $luaText `
+            -Encoding UTF8
+
+          Write-Host "luasession.cc patched successfully."
 
           # ------------------------------------------------------------
           # D. Patch luasession/wscript
@@ -439,7 +475,7 @@ jobs:
           }
 
           # ------------------------------------------------------------
-          # E. Print final state
+          # E. Verify final state
           # ------------------------------------------------------------
 
           Write-Host ""
@@ -452,7 +488,7 @@ jobs:
 
           Get-Content "luasession\luasession.cc" |
             Select-String `
-              -Pattern "ARDOUR_MSVC_GETOPT_LOCAL|GETOPT_API" `
+              -Pattern "pbd/msvc/getopt\.h|ARDOUR_MSVC_GETOPT_LOCAL|GETOPT_API" `
               -Context 2,3
 
           Write-Host ""
