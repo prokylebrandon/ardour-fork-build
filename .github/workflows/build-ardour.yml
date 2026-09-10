@@ -89,18 +89,56 @@ jobs:
       # We compile the MSVC getopt sources directly into the
       # luasession target so the symbols are available there.
       #
-      # FIX: upstream defines obj.source as a plain string
+      # FIX #1: upstream defines obj.source as a plain string
       # (e.g. obj.source = 'luasession.cc'), not a list. The
       # inserted code must normalize obj.source to a list before
       # doing += [...], otherwise Python raises:
       #   TypeError: can only concatenate str (not "list") to str
       # This normalization is written defensively so it also works
       # if upstream ever changes obj.source to already be a list.
+      #
+      # FIX #2: libpbd's own build already compiles the ORIGINAL
+      # getopt.c/getopt_long.c from this directory. If luasession
+      # compiles those same two source files directly, both task
+      # generators can end up writing to the identical output
+      # object path under build\, and under parallel jobs two
+      # cl.exe processes race to create that same file:
+      #   fatal error C1083: Cannot open compiler generated file:
+      #   '...\getopt_long.c.1.o': Permission denied
+      # To guarantee luasession never shares an output path with
+      # libpbd's own compile, we give luasession private,
+      # uniquely-named copies of the two sources (kept in the same
+      # directory, so any local #include "getopt.h" style includes
+      # keep resolving correctly).
       # ================================================================
       - name: Patch luasession MSVC getopt
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
+          $msvcDir = "libs\pbd\msvc"
+
+          $copies = @(
+            @{ Src = "getopt.c";      Dst = "getopt_luasession.c" },
+            @{ Src = "getopt_long.c"; Dst = "getopt_long_luasession.c" }
+          )
+
+          foreach ($copy in $copies) {
+            $srcPath = Join-Path $msvcDir $copy.Src
+            $dstPath = Join-Path $msvcDir $copy.Dst
+
+            if (-not (Test-Path $srcPath)) {
+              throw "$srcPath was not found; cannot create private copy for luasession."
+            }
+
+            if (-not (Test-Path $dstPath)) {
+              Copy-Item -Path $srcPath -Destination $dstPath
+              Write-Host "Created private copy: $dstPath"
+            }
+            else {
+              Write-Host "Private copy already exists: $dstPath"
+            }
+          }
 
           $file = "luasession\wscript"
 
@@ -111,7 +149,7 @@ jobs:
           # Already patched (e.g. re-run on a reused workspace)? Nothing to do.
           $existing = Get-Content $file -Raw
 
-          if ($existing.Contains("../libs/pbd/msvc/getopt_long.c")) {
+          if ($existing.Contains("../libs/pbd/msvc/getopt_long_luasession.c")) {
             Write-Host "luasession getopt patch already exists. Skipping."
             exit 0
           }
@@ -155,7 +193,11 @@ jobs:
           $innerInnerIndent = $innerIndent + "    "
 
           # NOTE: obj.source upstream is a STRING, not a list, so we
-          # must normalize it to a list before appending to it.
+          # must normalize it to a list before appending to it. We
+          # reference our OWN private copies of getopt.c/getopt_long.c
+          # (created above) rather than the originals, so this never
+          # shares an output object path with libpbd's own compile of
+          # the originals.
           $insertion = @(
             "",
             "${indent}if bld.env['build_target'] == 'msvc':",
@@ -164,8 +206,8 @@ jobs:
             "${innerIndent}else:",
             "${innerInnerIndent}obj.source = list(obj.source)",
             "${innerIndent}obj.source += [",
-            "${innerInnerIndent}'../libs/pbd/msvc/getopt.c',",
-            "${innerInnerIndent}'../libs/pbd/msvc/getopt_long.c',",
+            "${innerInnerIndent}'../libs/pbd/msvc/getopt_luasession.c',",
+            "${innerInnerIndent}'../libs/pbd/msvc/getopt_long_luasession.c',",
             "${innerIndent}]"
           )
 
@@ -178,7 +220,7 @@ jobs:
 
           Set-Content -Path $file -Value $newLines -Encoding UTF8
 
-          Write-Host "Added MSVC getopt sources to luasession."
+          Write-Host "Added private MSVC getopt copies to luasession."
           Write-Host ""
           Write-Host "Resulting section:"
           Get-Content $file |
