@@ -79,6 +79,50 @@ jobs:
           Write-Host "git describe HEAD = $($describe -join '')"
 
       # ================================================================
+      # 2B. DIAGNOSTIC: DUMP REAL GETOPT SOURCES
+      #
+      # Prior fix attempts guessed at macro gating (LIBPBD_DLL_EXPORTS)
+      # without ever seeing this fork's actual getopt.h / getopt.c /
+      # getopt_long.c. Dump them so the next failure is diagnosed from
+      # real source instead of another guess.
+      # ================================================================
+      - name: Dump getopt sources for diagnosis
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $files = @(
+            "libs\pbd\msvc\getopt.h",
+            "libs\pbd\msvc\getopt.c",
+            "libs\pbd\msvc\getopt_long.c"
+          )
+
+          foreach ($f in $files) {
+            Write-Host ""
+            Write-Host "=========================================================="
+            Write-Host "FILE: $f"
+            Write-Host "=========================================================="
+
+            if (-not (Test-Path $f)) {
+              Write-Host "NOT FOUND"
+              continue
+            }
+
+            Get-Content $f | ForEach-Object { Write-Host $_ }
+          }
+
+          Write-Host ""
+          Write-Host "=========================================================="
+          Write-Host "GREP: getopt_a / getopt_long_a / LIBPBD_DLL / dllimport / dllexport"
+          Write-Host "=========================================================="
+
+          Select-String `
+            -Path $files `
+            -Pattern "getopt_a|getopt_long_a|LIBPBD_DLL|dllimport|dllexport" `
+            -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+
+      # ================================================================
       # 3. PATCH LUASESSION MSVC GETOPT LINKING
       #
       # Ardour's libpbd contains getopt.c/getopt_long.c for MSVC,
