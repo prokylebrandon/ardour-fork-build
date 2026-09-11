@@ -1199,26 +1199,49 @@ jobs:
             Write-Host $directory
             Write-Host "=========================================================="
 
+            # ----------------------------------------------------------
             # VCPKG DLLs
+            # ----------------------------------------------------------
+
             foreach ($dll in $vcpkgDlls) {
 
+              $destination = Join-Path $directory $dll.Name
+
+              if ([System.IO.Path]::GetFullPath($dll.FullName) -ieq `
+                  [System.IO.Path]::GetFullPath($destination)) {
+                Write-Host "Skipping existing DLL: $($dll.Name)"
+                continue
+              }
+
               Copy-Item `
                 -Path $dll.FullName `
-                -Destination $directory `
+                -Destination $destination `
                 -Force
             }
 
+            # ----------------------------------------------------------
             # Ardour DLLs
+            # ----------------------------------------------------------
+
             foreach ($dll in $ardourDlls) {
 
+              $destination = Join-Path $directory $dll.Name
+
+              if ([System.IO.Path]::GetFullPath($dll.FullName) -ieq `
+                  [System.IO.Path]::GetFullPath($destination)) {
+                Write-Host "Skipping existing DLL: $($dll.Name)"
+                continue
+              }
+
               Copy-Item `
                 -Path $dll.FullName `
-                -Destination $directory `
+                -Destination $destination `
                 -Force
             }
 
-            Write-Host "Copied $($vcpkgDlls.Count) vcpkg DLLs."
-            Write-Host "Copied $($ardourDlls.Count) Ardour DLLs."
+            Write-Host ""
+            Write-Host "DLL bundling completed for:"
+            Write-Host "  $directory"
           }
 
           # ------------------------------------------------------------
