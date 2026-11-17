@@ -24,10 +24,6 @@
 #ifdef HAVE_USB
 #include "pbd/pthread_utils.h"
 
-#ifdef COMPILER_MSVC
-#define _WINSOCKAPI_
-#endif
-
 #include <libusb.h>
 /* ControlProtocolManager is a singleton, so we can use static
  * here. This has the advantage that libusb.h does not need
@@ -368,10 +364,6 @@ ControlProtocolManager::teardown (ControlProtocolInfo& cpi, bool lock_required)
 		cerr << "Programming error: ControlProtocolManager::teardown() called for " << cpi.name << ", but it was not found in control_protocols" << endl;
 	}
 
-	if (lock_required) {
-		lm.release ();
-	}
-
 	cpi.protocol = 0;
 	delete (Glib::Module*)cpi.descriptor->module;
 	/* cpi->descriptor is now inaccessible since dlclose() or equivalent
@@ -379,6 +371,10 @@ ControlProtocolManager::teardown (ControlProtocolInfo& cpi, bool lock_required)
 	 * object made accessible by dlopen().
 	 */
 	cpi.descriptor = 0;
+
+	if (lock_required) {
+		lm.release ();
+	}
 
 	ProtocolStatusChange (&cpi);
 
@@ -397,7 +393,7 @@ ControlProtocolManager::discover_control_protocols ()
 {
 	vector<std::string> cp_modules;
 
-#ifdef COMPILER_MSVC
+#if defined COMPILER_MSVC && !defined WAF_BUILD
 	/**
 	 * Different build targets (Debug / Release etc) use different versions
 	 * of the 'C' runtime (which can't be 'mixed & matched'). Therefore, in
@@ -647,6 +643,7 @@ ControlProtocolManager::probe_midi_control_protocols ()
 	}
 	for (auto const& cpi : _control_protocol_info) {
 		/* Note: manual teardown deletes the descriptor */
+		PBD::RWLock::ReaderLock lm (_protocols_lock);
 		if (!cpi->descriptor) {
 			cpi->automatic = false;
 			continue;
@@ -670,9 +667,11 @@ ControlProtocolManager::probe_midi_control_protocols ()
 					}
 				}
 			}
+			lm.release();
 			activate (*cpi, device_config);
 		} else if (active && cpi->automatic && !found) {
 			cpi->automatic = false;
+			lm.release();
 			deactivate (*cpi);
 			/* allow to auto-enable again */
 			if (!cpi->descriptor) {
@@ -733,6 +732,23 @@ ControlProtocolManager::stripable_selection_changed (StripableNotificationListPt
 		for (auto const& p : _control_protocols) {
 			DEBUG_TRACE (DEBUG::Selection, string_compose ("selection change notification for surface \"%1\"\n", p->name ()));
 			p->stripable_selection_changed ();
+		}
+	}
+}
+
+void
+ControlProtocolManager::do_surface_callback (bool only_once, SurfaceCallbackType type, void* arg)
+{
+	PBD::RWLock::ReaderLock lm (_protocols_lock);
+	for (auto const& p : _control_protocols) {
+		ControlProtocol::SurfaceCallback sc = p->surface_callback;
+		if (sc) {
+			lm.release ();
+			(p->*sc) (type, arg);
+			if (only_once) {
+				return;
+			}
+			lm.acquire ();
 		}
 	}
 }
